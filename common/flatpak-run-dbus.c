@@ -212,7 +212,7 @@ extract_unix_path_from_dbus_address (const char *address)
 }
 
 static char *
-create_proxy_socket (char *template)
+create_proxy_socket (const char *template)
 {
   g_autofree char *user_runtime_dir = flatpak_get_real_xdg_runtime_dir ();
   g_autofree char *proxy_socket_dir = g_build_filename (user_runtime_dir, ".dbus-proxy", NULL);
@@ -232,11 +232,12 @@ create_proxy_socket (char *template)
 }
 
 gboolean
-flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
-                                   FlatpakBwrap   *proxy_arg_bwrap,
-                                   FlatpakContext *context,
-                                   FlatpakRunFlags flags,
-                                   const char     *app_id)
+flatpak_run_add_session_dbus_args (FlatpakBwrap          *app_bwrap,
+                                   FlatpakBwrap          *proxy_arg_bwrap,
+                                   FlatpakContextSockets  sockets,
+                                   FlatpakContext        *context,
+                                   FlatpakRunFlags        flags,
+                                   const char            *app_id)
 {
   static const char sandbox_socket_path[] = "/run/flatpak/bus";
   static const char sandbox_dbus_address[] = "unix:path=/run/flatpak/bus";
@@ -244,7 +245,7 @@ flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
   const char *dbus_address = g_getenv ("DBUS_SESSION_BUS_ADDRESS");
   g_autofree char *dbus_session_socket = NULL;
 
-  unrestricted = (context->sockets & FLATPAK_CONTEXT_SOCKET_SESSION_BUS) != 0;
+  unrestricted = (sockets & FLATPAK_CONTEXT_SOCKET_SESSION_BUS) != 0;
 
   if (dbus_address != NULL)
     {
@@ -289,7 +290,7 @@ flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
 
       if (!unrestricted)
         {
-          flatpak_context_add_bus_filters (context, app_id, TRUE, flags & FLATPAK_RUN_FLAG_SANDBOX, proxy_arg_bwrap);
+          flatpak_context_add_bus_filters (context, app_id, FLATPAK_SESSION_BUS, flags & FLATPAK_RUN_FLAG_SANDBOX, proxy_arg_bwrap);
 
           /* Allow calling any interface+method on all portals, but only receive broadcasts under /org/desktop/portal */
           flatpak_bwrap_add_arg (proxy_arg_bwrap,
@@ -314,17 +315,18 @@ flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
 }
 
 gboolean
-flatpak_run_add_system_dbus_args (FlatpakBwrap   *app_bwrap,
-                                  FlatpakBwrap   *proxy_arg_bwrap,
-                                  FlatpakContext *context,
-                                  FlatpakRunFlags flags)
+flatpak_run_add_system_dbus_args (FlatpakBwrap          *app_bwrap,
+                                  FlatpakBwrap          *proxy_arg_bwrap,
+                                  FlatpakContextSockets  sockets,
+                                  FlatpakContext        *context,
+                                  FlatpakRunFlags        flags)
 {
   gboolean unrestricted, no_proxy;
   const char *dbus_address = g_getenv ("DBUS_SYSTEM_BUS_ADDRESS");
   g_autofree char *real_dbus_address = NULL;
   g_autofree char *dbus_system_socket = NULL;
 
-  unrestricted = (context->sockets & FLATPAK_CONTEXT_SOCKET_SYSTEM_BUS) != 0;
+  unrestricted = (sockets & FLATPAK_CONTEXT_SOCKET_SYSTEM_BUS) != 0;
   if (unrestricted)
     g_info ("Allowing system-dbus access");
 
@@ -359,7 +361,7 @@ flatpak_run_add_system_dbus_args (FlatpakBwrap   *app_bwrap,
       flatpak_bwrap_add_args (proxy_arg_bwrap, real_dbus_address, proxy_socket, NULL);
 
       if (!unrestricted)
-        flatpak_context_add_bus_filters (context, NULL, FALSE, flags & FLATPAK_RUN_FLAG_SANDBOX, proxy_arg_bwrap);
+        flatpak_context_add_bus_filters (context, NULL, FLATPAK_SYSTEM_BUS, flags & FLATPAK_RUN_FLAG_SANDBOX, proxy_arg_bwrap);
 
       if ((flags & FLATPAK_RUN_FLAG_LOG_SYSTEM_BUS) != 0)
         flatpak_bwrap_add_args (proxy_arg_bwrap, "--log", NULL);
@@ -375,10 +377,11 @@ flatpak_run_add_system_dbus_args (FlatpakBwrap   *app_bwrap,
 }
 
 gboolean
-flatpak_run_add_a11y_dbus_args (FlatpakBwrap   *app_bwrap,
-                                FlatpakBwrap   *proxy_arg_bwrap,
-                                FlatpakContext *context,
-                                FlatpakRunFlags flags)
+flatpak_run_add_a11y_dbus_args (FlatpakBwrap    *app_bwrap,
+                                FlatpakBwrap    *proxy_arg_bwrap,
+                                FlatpakContext  *context,
+                                FlatpakRunFlags  flags,
+                                const char      *app_id)
 {
   static const char sandbox_socket_path[] = "/run/flatpak/at-spi-bus";
   static const char sandbox_dbus_address[] = "unix:path=/run/flatpak/at-spi-bus";
@@ -388,6 +391,8 @@ flatpak_run_add_a11y_dbus_args (FlatpakBwrap   *app_bwrap,
   g_autoptr(GDBusMessage) reply = NULL;
   g_autoptr(GDBusMessage) msg = NULL;
   g_autofree char *proxy_socket = NULL;
+  gboolean sandboxed;
+  const char *value;
 
   if ((flags & FLATPAK_RUN_FLAG_NO_A11Y_BUS_PROXY) != 0)
     return FALSE;
@@ -396,26 +401,45 @@ flatpak_run_add_a11y_dbus_args (FlatpakBwrap   *app_bwrap,
   if (session_bus == NULL)
     return FALSE;
 
-  msg = g_dbus_message_new_method_call ("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress");
-  g_dbus_message_set_body (msg, g_variant_new ("()"));
-  reply =
-    g_dbus_connection_send_message_with_reply_sync (session_bus, msg,
-                                                    G_DBUS_SEND_MESSAGE_FLAGS_NONE,
-                                                    30000,
-                                                    NULL,
-                                                    NULL,
-                                                    NULL);
-  if (reply)
+  value = g_getenv ("AT_SPI_BUS_ADDRESS");
+
+  if (value != NULL && value[0] != '\0')
     {
-      if (g_dbus_message_to_gerror (reply, &local_error))
+      a11y_address = g_strdup (value);
+      g_debug ("Retrieved AT-SPI bus address \"%s\" from environment",
+               a11y_address);
+    }
+
+  /* To have an accurate emulation of AT-SPI's behaviour, ideally we would
+   * also query the AT_SPI_BUS atom on the root window if a11y_address is
+   * still NULL here, but that would require a libX11 dependency, and
+   * isn't done when running under native Wayland anyway. */
+
+  if (a11y_address == NULL)
+    {
+      msg = g_dbus_message_new_method_call ("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress");
+      g_dbus_message_set_body (msg, g_variant_new ("()"));
+      reply =
+        g_dbus_connection_send_message_with_reply_sync (session_bus, msg,
+                                                        G_DBUS_SEND_MESSAGE_FLAGS_NONE,
+                                                        30000,
+                                                        NULL,
+                                                        NULL,
+                                                        NULL);
+      if (reply)
         {
-          if (!g_error_matches (local_error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN))
-            g_message ("Can't find a11y bus: %s", local_error->message);
-        }
-      else
-        {
-          g_variant_get (g_dbus_message_get_body (reply),
-                         "(s)", &a11y_address);
+          if (g_dbus_message_to_gerror (reply, &local_error))
+            {
+              if (!g_error_matches (local_error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN))
+                g_message ("Can't find a11y bus: %s", local_error->message);
+            }
+          else
+            {
+              g_variant_get (g_dbus_message_get_body (reply),
+                             "(s)", &a11y_address);
+              g_debug ("Retrieved AT-SPI bus address \"%s\" from session bus",
+                       a11y_address);
+            }
         }
     }
 
@@ -429,6 +453,8 @@ flatpak_run_add_a11y_dbus_args (FlatpakBwrap   *app_bwrap,
   flatpak_bwrap_add_args (proxy_arg_bwrap,
                           a11y_address,
                           proxy_socket, "--filter", "--sloppy-names",
+                          "--broadcast=org.a11y.atspi.Registry.EventListenerRegistered=@/org/a11y/atspi/registry",
+                          "--broadcast=org.a11y.atspi.Registry.EventListenerDeregistered=@/org/a11y/atspi/registry",
                           "--call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@/org/a11y/atspi/accessible/root",
                           "--call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Unembed@/org/a11y/atspi/accessible/root",
                           "--call=org.a11y.atspi.Registry=org.a11y.atspi.Registry.GetRegisteredEvents@/org/a11y/atspi/registry",
@@ -437,6 +463,16 @@ flatpak_run_add_a11y_dbus_args (FlatpakBwrap   *app_bwrap,
                           "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersSync@/org/a11y/atspi/registry/deviceeventcontroller",
                           "--call=org.a11y.atspi.Registry=org.a11y.atspi.DeviceEventController.NotifyListenersAsync@/org/a11y/atspi/registry/deviceeventcontroller",
                           NULL);
+
+  sandboxed = flags & FLATPAK_RUN_FLAG_SANDBOX;
+
+  flatpak_context_add_bus_filters (context, app_id, FLATPAK_A11Y_BUS, sandboxed, proxy_arg_bwrap);
+
+  /* Allow the main sandbox instance call org.a11y.atspi.Socket.Embedded() on
+   * well-known names of the subsandboxes' objects on the a11y bus.
+   */
+  if (!sandboxed)
+    flatpak_bwrap_add_arg_printf (proxy_arg_bwrap, "--call=%s.Sandboxed.*=org.a11y.atspi.Socket.Embedded", app_id);
 
   if ((flags & FLATPAK_RUN_FLAG_LOG_A11Y_BUS) != 0)
     flatpak_bwrap_add_args (proxy_arg_bwrap, "--log", NULL);

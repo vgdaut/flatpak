@@ -28,13 +28,23 @@
 #include <gio/gio.h>
 #include "libglnx.h"
 
+const char *
+flatpak_get_tzdir (void)
+{
+  const gchar *tzdir;
+
+  tzdir = getenv ("TZDIR");
+  if (tzdir)
+    return tzdir;
+
+  return "/usr/share/zoneinfo";
+}
+
 char *
 flatpak_get_timezone (void)
 {
   g_autofree gchar *symlink = NULL;
   gchar *etc_timezone = NULL;
-  const gchar *tzdir;
-  const gchar *default_tzdir = "/usr/share/zoneinfo";
 
   symlink = flatpak_resolve_link ("/etc/localtime", NULL);
   if (symlink != NULL)
@@ -42,22 +52,12 @@ flatpak_get_timezone (void)
       /* Resolve relative path */
       g_autofree gchar *canonical = flatpak_canonicalize_filename (symlink);
       char *canonical_suffix;
+      const gchar *tzdir = flatpak_get_tzdir ();
 
       /* Strip the prefix and slashes if possible. */
-
-      tzdir = getenv ("TZDIR");
-      if (tzdir != NULL && g_str_has_prefix (canonical, tzdir))
+      if (g_str_has_prefix (canonical, tzdir))
         {
           canonical_suffix = canonical + strlen (tzdir);
-          while (*canonical_suffix == '/')
-            canonical_suffix++;
-
-          return g_strdup (canonical_suffix);
-        }
-
-      if (g_str_has_prefix (canonical, default_tzdir))
-        {
-          canonical_suffix = canonical + strlen (default_tzdir);
           while (*canonical_suffix == '/')
             canonical_suffix++;
 
@@ -98,6 +98,29 @@ flatpak_resolve_link (const char *path,
 
   dirname = g_path_get_dirname (path);
   return g_build_filename (dirname, link, NULL);
+}
+
+char *
+flatpak_realpath (const char  *path,
+                  GError     **error)
+{
+  struct stat stbuf;
+
+  if (!glnx_fstatat (AT_FDCWD, path, &stbuf, AT_SYMLINK_NOFOLLOW, error))
+    return NULL;
+
+  if (S_ISLNK (stbuf.st_mode))
+    {
+      g_autofree char *resolved = NULL;
+
+      resolved = flatpak_resolve_link (path, error);
+      if (!resolved)
+        return NULL;
+
+      return flatpak_canonicalize_filename (resolved);
+    }
+
+  return flatpak_canonicalize_filename (path);
 }
 
 /*

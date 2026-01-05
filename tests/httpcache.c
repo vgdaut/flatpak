@@ -10,9 +10,6 @@ main (int argc, char *argv[])
   const char *url, *dest;
   int flags = 0;
 
-  /* Avoid weird recursive type initialization deadlocks from libsoup */
-  g_type_ensure (G_TYPE_SOCKET);
-
   if (argc == 3)
     {
       url = argv[1];
@@ -32,7 +29,7 @@ main (int argc, char *argv[])
 
 
   if (!flatpak_cache_http_uri (session,
-                               url,
+                               url, NULL,
                                flags,
                                AT_FDCWD, dest,
                                NULL, NULL, NULL, &error))

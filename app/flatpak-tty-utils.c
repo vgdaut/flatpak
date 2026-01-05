@@ -521,3 +521,37 @@ flatpak_print_escaped_string (const char        *s,
   g_autofree char *escaped = flatpak_escape_string (s, flags);
   g_print ("%s", escaped);
 }
+
+static gboolean
+use_progress_escape_sequence (void)
+{
+  static gsize tty_progress_once = 0;
+  enum {
+    TTY_PROGRESS_ENABLED = 1,
+    TTY_PROGRESS_DISABLED = 2
+  };
+
+  if (g_once_init_enter (&tty_progress_once))
+    {
+      if (g_strcmp0 (g_getenv ("FLATPAK_TTY_PROGRESS"), "0") == 0)
+        g_once_init_leave (&tty_progress_once, TTY_PROGRESS_DISABLED);
+      else
+        g_once_init_leave (&tty_progress_once, TTY_PROGRESS_ENABLED);
+    }
+
+  return tty_progress_once == TTY_PROGRESS_ENABLED;
+}
+
+void
+flatpak_pty_clear_progress (void)
+{
+  if (use_progress_escape_sequence ())
+    g_print ("\033]9;4;0\e\\");
+}
+
+void
+flatpak_pty_set_progress (guint percent)
+{
+  if (use_progress_escape_sequence ())
+    g_print ("\033]9;4;1;%d\e\\", MIN (percent, 100));
+}

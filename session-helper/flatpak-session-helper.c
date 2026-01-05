@@ -215,7 +215,7 @@ handle_host_command (FlatpakDevelopment    *object,
   gsize i, j, n_fds, n_envs;
   const gint *fds;
   g_autofree FdMapEntry *fd_map = NULL;
-  gchar **env;
+  g_auto(GStrv) env = NULL;
   gint32 max_fd;
 
   if (*arg_cwd_path == 0)
@@ -563,12 +563,15 @@ static void file_changed (GFileMonitor     *monitor,
 static void
 update_real_monitor (MonitorData *data)
 {
-  char *real = realpath (data->source, NULL);
+  char *real = NULL;
+  g_autoptr(GError) error = NULL;
+
+  real = flatpak_realpath (data->source, &error);
 
   if (real == NULL)
     {
       g_info ("unable to get real path to monitor host file %s: %s", data->source,
-              g_strerror (errno));
+              error->message);
       return;
     }
 
@@ -697,7 +700,7 @@ start_p11_kit_server (const char *flatpak_dir)
   g_autoptr(GError) local_error = NULL;
   g_auto(GStrv) stdout_lines = NULL;
   int i;
-  char *p11_argv[] = {
+  const char * const p11_argv[] = {
     "p11-kit", "server",
     /* We explicitly request --sh here, because we then fail on earlier versions that doesn't support
      * this flag. This is good, because those earlier versions did not properly daemonize and caused
@@ -713,7 +716,8 @@ start_p11_kit_server (const char *flatpak_dir)
   g_info ("starting p11-kit server");
 
   if (!g_spawn_sync (NULL,
-                     p11_argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL,
+                     (char **) p11_argv, NULL,
+                     G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL,
                      NULL, NULL,
                      &p11_kit_stdout, NULL,
                      &exit_status, &local_error))

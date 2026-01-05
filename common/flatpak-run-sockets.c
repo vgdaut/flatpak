@@ -176,24 +176,18 @@ flatpak_run_add_socket_args_environment (FlatpakBwrap         *bwrap,
                                          const char           *app_id,
                                          const char           *instance_id)
 {
-  gboolean has_wayland = FALSE;
-  gboolean allow_x11;
+  gboolean allow_wayland;
   gboolean inherit_wayland_socket;
+  gboolean allow_x11;
 
-  if (sockets & FLATPAK_CONTEXT_SOCKET_WAYLAND)
-    {
-      g_info ("Allowing wayland access");
-      g_assert (app_id && instance_id);
-      inherit_wayland_socket = (sockets & FLATPAK_CONTEXT_SOCKET_INHERIT_WAYLAND_SOCKET) != 0;
-      has_wayland = flatpak_run_add_wayland_args (bwrap, app_id, instance_id,
-                                                  inherit_wayland_socket);
-    }
+  allow_wayland = (sockets & FLATPAK_CONTEXT_SOCKET_WAYLAND) != 0;
+  inherit_wayland_socket = (sockets & FLATPAK_CONTEXT_SOCKET_INHERIT_WAYLAND_SOCKET) != 0;
+  flatpak_run_add_wayland_args (bwrap,
+                                app_id, instance_id,
+                                allow_wayland,
+                                inherit_wayland_socket);
 
-  if ((sockets & FLATPAK_CONTEXT_SOCKET_FALLBACK_X11) != 0)
-    allow_x11 = !has_wayland;
-  else
-    allow_x11 = (sockets & FLATPAK_CONTEXT_SOCKET_X11) != 0;
-
+  allow_x11 = (sockets & FLATPAK_CONTEXT_SOCKET_X11) != 0;
   flatpak_run_add_x11_args (bwrap, allow_x11, shares);
 
   if (sockets & FLATPAK_CONTEXT_SOCKET_SSH_AUTH)

@@ -49,10 +49,14 @@
 
 #include "flatpak-appdata-private.h"
 #include "flatpak-dir-private.h"
+#include "flatpak-dir-utils-private.h"
 #include "flatpak-error.h"
 #include "flatpak-locale-utils-private.h"
+#include "flatpak-image-collection-private.h"
+#include "flatpak-image-source-private.h"
 #include "flatpak-oci-registry-private.h"
 #include "flatpak-ref.h"
+#include "flatpak-repo-utils-private.h"
 #include "flatpak-run-private.h"
 #include "flatpak-utils-base-private.h"
 #include "flatpak-variant-private.h"
@@ -78,10 +82,23 @@
 
 #define SYSCONF_INSTALLATIONS_DIR "installations.d"
 #define SYSCONF_INSTALLATIONS_FILE_EXT ".conf"
-#define SYSCONF_REMOTES_DIR "remotes.d"
-#define SYSCONF_REMOTES_FILE_EXT ".flatpakrepo"
+
+#define FLATPAK_REMOTES_DIR "remotes.d"
+#define FLATPAK_REMOTES_FILE_EXT ".flatpakrepo"
+
+#define FLATPAK_PREINSTALL_DIR "preinstall.d"
+#define FLATPAK_PREINSTALL_FILE_EXT ".preinstall"
+
+#define FLATPAK_PREINSTALL_GROUP_PREFIX "Flatpak Preinstall "
+#define FLATPAK_PREINSTALL_IS_RUNTIME_KEY "IsRuntime"
+#define FLATPAK_PREINSTALL_NAME_KEY "Name"
+#define FLATPAK_PREINSTALL_BRANCH_KEY "Branch"
+#define FLATPAK_PREINSTALL_COLLECTION_ID_KEY "CollectionID"
+#define FLATPAK_PREINSTALL_INSTALL_KEY "Install"
 
 #define SIDELOAD_REPOS_DIR_NAME "sideload-repos"
+
+#define FLATPAK_TRIGGERS_DIR "triggers"
 
 #ifdef USE_SYSTEM_HELPER
 /* This uses a weird Auto prefix to avoid conflicts with later added polkit types.
@@ -117,7 +134,7 @@ static gboolean flatpak_dir_mirror_oci (FlatpakDir          *self,
                                         FlatpakRemoteState  *state,
                                         const char          *ref,
                                         const char          *opt_rev,
-                                        const char          *skip_if_current_is,
+                                        FlatpakImageSource  *opt_image_source,
                                         const char          *token,
                                         FlatpakProgress     *progress,
                                         GCancellable        *cancellable,
@@ -167,6 +184,9 @@ static gboolean flatpak_dir_lookup_remote_filter (FlatpakDir *self,
                                                   GRegex    **allow_regex,
                                                   GRegex    **deny_regex,
                                                   GError **error);
+
+static char *flatpak_dir_get_remote_signature_lookaside (FlatpakDir *self,
+                                                         const char *remote_name);
 
 static void ensure_http_session (FlatpakDir *self);
 
@@ -232,7 +252,7 @@ struct FlatpakDir
   GFile           *cache_dir;
   gboolean         no_system_helper;
   gboolean         no_interaction;
-  pid_t            source_pid;
+  PolkitSubject   *subject;
 
   GDBusConnection *system_helper_bus;
 
@@ -306,6 +326,25 @@ get_config_dir_location (void)
 }
 
 static const char *
+get_data_dir_location (void)
+{
+  static gsize path = 0;
+
+  if (g_once_init_enter (&path))
+    {
+      gsize setup_value = 0;
+      const char *data_dir = g_getenv ("FLATPAK_DATA_DIR");
+      if (data_dir != NULL)
+        setup_value = (gsize) data_dir;
+      else
+        setup_value = (gsize) FLATPAK_DATADIR;
+      g_once_init_leave (&path, setup_value);
+    }
+
+  return (const char *) path;
+}
+
+static const char *
 get_run_dir_location (void)
 {
   static gsize path = 0;
@@ -350,6 +389,7 @@ flatpak_remote_state_new (void)
 
   state->refcount = 1;
   state->sideload_repos = g_ptr_array_new_with_free_func ((GDestroyNotify)flatpak_sideload_state_free);
+  state->sideload_image_collections = g_ptr_array_new_with_free_func ((GDestroyNotify)g_object_unref);
   state->subsummaries = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify)variant_maybe_unref);
   return state;
 }
@@ -383,6 +423,7 @@ flatpak_remote_state_unref (FlatpakRemoteState *remote_state)
       g_clear_pointer (&remote_state->allow_refs, g_regex_unref);
       g_clear_pointer (&remote_state->deny_refs, g_regex_unref);
       g_clear_pointer (&remote_state->sideload_repos, g_ptr_array_unref);
+      g_clear_pointer (&remote_state->sideload_image_collections, g_ptr_array_unref);
 
       g_free (remote_state);
     }
@@ -443,6 +484,13 @@ flatpak_remote_state_add_sideload_repo (FlatpakRemoteState *self,
           g_info ("Using sideloaded repo %s for remote %s", flatpak_file_get_path_cached (dir), self->remote_name);
         }
     }
+}
+
+void
+flatpak_remote_state_add_sideload_image_collection (FlatpakRemoteState     *self,
+                                                    FlatpakImageCollection *image_collection)
+{
+  g_ptr_array_add (self->sideload_image_collections, g_object_ref (image_collection));
 }
 
 static void add_sideload_subdirs (GPtrArray *res,
@@ -631,31 +679,57 @@ get_timestamp_from_ref_info (VarRefInfoRef info)
  }
 
 
-GFile *
-flatpak_remote_state_lookup_sideload_checksum (FlatpakRemoteState *self,
-                                               char               *checksum)
+void
+flatpak_remote_state_lookup_sideload_checksum (FlatpakRemoteState   *self,
+                                               char                 *checksum,
+                                               GFile               **out_sideload_path,
+                                               FlatpakImageSource  **out_image_source)
 {
-  for (int i = 0; i < self->sideload_repos->len; i++)
+  if (out_sideload_path)
+    *out_sideload_path = NULL;
+  if (out_image_source)
+    *out_image_source = NULL;
+
+  if (self->is_oci && out_image_source)
     {
-      FlatpakSideloadState *ss = g_ptr_array_index (self->sideload_repos, i);
-      OstreeRepoCommitState commit_state;
+      g_autofree char *digest = g_strconcat ("sha256:", checksum, NULL);
 
-      if (ostree_repo_load_commit (ss->repo, checksum, NULL, &commit_state, NULL) &&
-          commit_state == OSTREE_REPO_COMMIT_STATE_NORMAL)
-        return g_object_ref (ostree_repo_get_path (ss->repo));
+      for (int i = 0; i < self->sideload_image_collections->len; i++)
+        {
+          FlatpakImageCollection *collection = g_ptr_array_index (self->sideload_image_collections, i);
+          g_autoptr(FlatpakImageSource) image_source = flatpak_image_collection_lookup_digest (collection, digest);
+          if (image_source)
+            {
+              *out_image_source = g_steal_pointer (&image_source);
+              return;
+            }
+        }
     }
+  else if (!self->is_oci && out_sideload_path)
+    {
+      for (int i = 0; i < self->sideload_repos->len; i++)
+        {
+          FlatpakSideloadState *ss = g_ptr_array_index (self->sideload_repos, i);
+          OstreeRepoCommitState commit_state;
 
-  return NULL;
+          if (ostree_repo_load_commit (ss->repo, checksum, NULL, &commit_state, NULL) &&
+              commit_state == OSTREE_REPO_COMMIT_STATE_NORMAL)
+            {
+              *out_sideload_path = g_object_ref (ostree_repo_get_path (ss->repo));
+              return;
+            }
+        }
+    }
 }
 
 static gboolean
-flatpak_remote_state_resolve_sideloaded_ref (FlatpakRemoteState *self,
-                                             const char         *ref,
-                                             char              **out_checksum,
-                                             guint64            *out_timestamp,
-                                             VarRefInfoRef      *out_info,
-                                             FlatpakSideloadState  **out_sideload_state,
-                                             GError            **error)
+flatpak_remote_state_resolve_sideloaded_ref_repos (FlatpakRemoteState    *self,
+                                                   const char            *ref,
+                                                   char                 **out_checksum,
+                                                   guint64               *out_timestamp,
+                                                   VarRefInfoRef         *out_info,
+                                                   FlatpakSideloadState **out_sideload_state,
+                                                   GError               **error)
 {
   g_autofree char *latest_checksum = NULL;
   guint64 latest_timestamp = 0;
@@ -700,6 +774,70 @@ flatpak_remote_state_resolve_sideloaded_ref (FlatpakRemoteState *self,
   return TRUE;
 }
 
+static gboolean
+flatpak_remote_state_resolve_sideloaded_ref_images (FlatpakRemoteState  *self,
+                                                    const char          *ref,
+                                                    char               **out_checksum,
+                                                    guint64             *out_timestamp,
+                                                    VarRefInfoRef       *out_info,
+                                                    FlatpakImageSource **out_image_source,
+                                                    GError             **error)
+{
+  g_autoptr(FlatpakImageSource) image_source = NULL;
+
+  for (int i = 0; i < self->sideload_image_collections->len; i++)
+    {
+      FlatpakImageCollection *collection = g_ptr_array_index (self->sideload_image_collections, i);
+      image_source = flatpak_image_collection_lookup_ref (collection, ref);
+      if (image_source)
+        break;
+    }
+
+  if (image_source == NULL)
+    return flatpak_fail_error (error, FLATPAK_ERROR_REF_NOT_FOUND,
+                               _("No such ref '%s' in remote %s"),
+                               ref, self->remote_name);
+
+  if (out_checksum)
+    {
+      const char *digest = flatpak_image_source_get_digest (image_source);
+      g_assert (g_str_has_prefix (digest, "sha256:"));
+      *out_checksum = g_strdup (digest + 7);
+    }
+
+  if (out_timestamp)
+    *out_timestamp = flatpak_image_source_get_commit_timestamp (image_source);
+
+  if (out_image_source)
+    *out_image_source = g_steal_pointer (&image_source);
+
+  return TRUE;
+}
+
+static gboolean
+flatpak_remote_state_resolve_sideloaded_ref (FlatpakRemoteState    *self,
+                                             const char            *ref,
+                                             char                 **out_checksum,
+                                             guint64               *out_timestamp,
+                                             VarRefInfoRef         *out_info,
+                                             FlatpakSideloadState **out_sideload_state,
+                                             FlatpakImageSource   **out_image_source,
+                                             GError               **error)
+{
+  if (out_sideload_state)
+    *out_sideload_state = NULL;
+  if (out_image_source)
+    *out_image_source = NULL;
+
+  if (self->is_oci)
+    return flatpak_remote_state_resolve_sideloaded_ref_images (self, ref, out_checksum, out_timestamp, out_info,
+                                                               out_image_source, error);
+  else
+    return flatpak_remote_state_resolve_sideloaded_ref_repos (self, ref, out_checksum, out_timestamp, out_info,
+                                                               out_sideload_state, error);
+
+}
+
 static GVariant *
 get_summary_for_ref (FlatpakRemoteState *self,
                      const char *ref)
@@ -729,16 +867,22 @@ get_summary_for_ref (FlatpakRemoteState *self,
 
 /* Returns TRUE if the ref is found in the summary or cache.
  * out_checksum and out_variant are only set when the ref is found.
+ *
+ * NOTE: The _internal() variant has the odd constraint that *out_info is only
+ * valid if *out_image_source is NULL.
  */
-gboolean
-flatpak_remote_state_lookup_ref (FlatpakRemoteState *self,
-                                 const char         *ref,
-                                 char              **out_checksum,
-                                 guint64            *out_timestamp,
-                                 VarRefInfoRef      *out_info,
-                                 GFile             **out_sideload_path,
-                                 GError            **error)
+static gboolean
+flatpak_remote_state_lookup_ref_internal (FlatpakRemoteState  *self,
+                                          const char          *ref,
+                                          char               **out_checksum,
+                                          guint64             *out_timestamp,
+                                          VarRefInfoRef       *out_info,
+                                          GFile              **out_sideload_path,
+                                          FlatpakImageSource **out_image_source,
+                                          GError             **error)
 {
+  g_assert (out_info == NULL || out_image_source != NULL);
+
   if (!flatpak_remote_state_allow_ref (self, ref))
     {
       return flatpak_fail_error (error, FLATPAK_ERROR_REF_NOT_FOUND,
@@ -761,26 +905,7 @@ flatpak_remote_state_lookup_ref (FlatpakRemoteState *self,
                                    ref, self->remote_name);
 
       /* Even if its available in the summary we want to install it from a sideload repo if available */
-
-      if (out_sideload_path)
-        {
-          g_autoptr(GFile) found_sideload_path = NULL;
-
-          for (int i = 0; i < self->sideload_repos->len; i++)
-            {
-              FlatpakSideloadState *ss = g_ptr_array_index (self->sideload_repos, i);
-              OstreeRepoCommitState commit_state;
-
-              if (ostree_repo_load_commit (ss->repo, checksum, NULL, &commit_state, NULL) &&
-                  commit_state == OSTREE_REPO_COMMIT_STATE_NORMAL)
-                {
-                  found_sideload_path = g_object_ref (ostree_repo_get_path (ss->repo));
-                  break;
-                }
-            }
-
-          *out_sideload_path = g_steal_pointer (&found_sideload_path);
-        }
+      flatpak_remote_state_lookup_sideload_checksum (self, checksum, out_sideload_path, out_image_source);
 
       if (out_info)
         *out_info = info;
@@ -792,13 +917,55 @@ flatpak_remote_state_lookup_ref (FlatpakRemoteState *self,
   else
     {
       FlatpakSideloadState *ss = NULL;
+      g_autoptr(GFile) found_sideload_path = NULL;
 
-      if (!flatpak_remote_state_resolve_sideloaded_ref (self, ref, out_checksum, out_timestamp, out_info, &ss, error))
+      if (!flatpak_remote_state_resolve_sideloaded_ref (self, ref, out_checksum, out_timestamp, out_info, &ss, out_image_source, error))
         return FALSE;
 
+      if (ss)
+        found_sideload_path = g_object_ref (ostree_repo_get_path (ss->repo));
+
       if (out_sideload_path)
-        *out_sideload_path = g_object_ref (ostree_repo_get_path (ss->repo));
+        *out_sideload_path = g_steal_pointer (&found_sideload_path);
     }
+
+  return TRUE;
+}
+
+/* Returns TRUE if the ref is found in the summary or cache.
+ * out parameters are only set if the ref is found.
+ */
+gboolean
+flatpak_remote_state_lookup_ref (FlatpakRemoteState  *self,
+                                 const char          *ref,
+                                 char               **out_checksum,
+                                 guint64             *out_timestamp,
+                                 GVariant           **out_summary_metadata,
+                                 GFile              **out_sideload_path,
+                                 FlatpakImageSource **out_image_source,
+                                 GError             **error)
+{
+  VarRefInfoRef info;
+  g_autoptr(FlatpakImageSource) image_source = NULL;
+
+  if (!flatpak_remote_state_lookup_ref_internal (self, ref,
+                                                 out_checksum,
+                                                 out_timestamp,
+                                                 &info,
+                                                 out_sideload_path,
+                                                 &image_source,
+                                                 error))
+    return FALSE;
+
+  if (out_summary_metadata)
+    {
+      *out_summary_metadata = image_source ?
+        flatpak_image_source_make_summary_metadata (image_source) :
+        var_metadata_dup_to_gvariant (var_ref_info_get_metadata (info));
+    }
+
+  if (out_image_source)
+    *out_image_source = g_steal_pointer (&image_source);
 
   return TRUE;
 }
@@ -970,8 +1137,8 @@ flatpak_remote_state_load_data (FlatpakRemoteState *self,
       /* Look up from sideload */
       g_autofree char *checksum = NULL;
       guint64 timestamp;
-      VarRefInfoRef info;
       FlatpakSideloadState *ss = NULL;
+      g_autoptr(FlatpakImageSource) image_source = NULL;
       g_autoptr(GVariant) commit_data = NULL;
       g_autoptr(GVariant) commit_metadata = NULL;
       const char *xa_metadata = NULL;
@@ -981,13 +1148,23 @@ flatpak_remote_state_load_data (FlatpakRemoteState *self,
       /* Use sideload refs if any */
 
       if (!flatpak_remote_state_resolve_sideloaded_ref (self, ref, &checksum, &timestamp,
-                                                        &info, &ss, error))
+                                                        NULL, &ss, &image_source, error))
         return FALSE;
 
-      if (!ostree_repo_load_commit (ss->repo, checksum, &commit_data, NULL, error))
-        return FALSE;
+      if (image_source)
+        {
+          g_autoptr(GVariantBuilder) metadata_builder = g_variant_builder_new (G_VARIANT_TYPE ("a{sv}"));
+          flatpak_image_source_build_commit_metadata (image_source, metadata_builder);
+          commit_metadata = g_variant_builder_end (metadata_builder);
+        }
+      else
+        {
+          if (!ostree_repo_load_commit (ss->repo, checksum, &commit_data, NULL, error))
+            return FALSE;
 
-      commit_metadata = g_variant_get_child_value (commit_data, 0);
+          commit_metadata = g_variant_get_child_value (commit_data, 0);
+        }
+
       g_variant_lookup (commit_metadata, "xa.metadata", "&s", &xa_metadata);
       if (xa_metadata == NULL)
         return flatpak_fail (error, "No xa.metadata in sideload commit %s ref %s", checksum, ref);
@@ -1025,14 +1202,18 @@ lookup_oci_registry_uri_from_summary (GVariant *summary,
   return g_steal_pointer (&registry_uri);
 }
 
-static FlatpakOciRegistry *
-flatpak_remote_state_new_oci_registry (FlatpakRemoteState *self,
-                                       const char   *token,
-                                       GCancellable *cancellable,
-                                       GError      **error)
+static FlatpakImageSource *
+flatpak_remote_state_new_image_source (FlatpakRemoteState  *self,
+                                       FlatpakDir          *dir,
+                                       const char          *oci_repository,
+                                       const char          *digest,
+                                       const char          *token,
+                                       GCancellable        *cancellable,
+                                       GError             **error)
 {
   g_autofree char *registry_uri = NULL;
-  g_autoptr(FlatpakOciRegistry) registry = NULL;
+  g_autoptr(FlatpakImageSource) image_source = NULL;
+  g_autofree char *signature_lookaside = NULL;
 
   if (!flatpak_remote_state_ensure_summary (self, error))
     return NULL;
@@ -1041,47 +1222,35 @@ flatpak_remote_state_new_oci_registry (FlatpakRemoteState *self,
   if (registry_uri == NULL)
     return NULL;
 
-  registry = flatpak_oci_registry_new (registry_uri, FALSE, -1, NULL, error);
-  if (registry == NULL)
+  signature_lookaside = flatpak_dir_get_remote_signature_lookaside (dir, self->remote_name);
+
+  image_source = flatpak_image_source_new_remote (registry_uri,
+                                                  oci_repository,
+                                                  digest,
+                                                  token,
+                                                  signature_lookaside,
+                                                  NULL, error);
+  if (image_source == NULL)
     return NULL;
 
-  flatpak_oci_registry_set_token (registry, token);
-
-  return g_steal_pointer (&registry);
+  return g_steal_pointer (&image_source);
 }
 
-static GVariant *
-flatpak_remote_state_fetch_commit_object_oci (FlatpakRemoteState *self,
-                                              FlatpakDir   *dir,
-                                              const char   *ref,
-                                              const char   *checksum,
-                                              const char   *token,
-                                              GCancellable *cancellable,
-                                              GError      **error)
+FlatpakImageSource *
+flatpak_remote_state_fetch_image_source (FlatpakRemoteState *self,
+                                         FlatpakDir         *dir,
+                                         const char         *ref,
+                                         const char         *opt_rev,
+                                         const char         *token,
+                                         GCancellable       *cancellable,
+                                         GError            **error)
 {
-  g_autoptr(FlatpakOciRegistry) registry = NULL;
-  g_autoptr(FlatpakOciVersioned) versioned = NULL;
-  g_autoptr(FlatpakOciImage) image_config = NULL;
-  g_autofree char *oci_digest = NULL;
+  g_autoptr(FlatpakImageSource) image_source = NULL;
   g_autofree char *latest_rev = NULL;
   VarRefInfoRef latest_rev_info;
-  VarMetadataRef metadata;
-  const char *oci_repository = NULL;
-  GHashTable *labels;
-  g_autofree char *subject = NULL;
-  g_autofree char *body = NULL;
-  g_autofree char *manifest_ref = NULL;
-  g_autofree char *parent = NULL;
-  guint64 timestamp = 0;
-  g_autoptr(GVariantBuilder) metadata_builder = g_variant_builder_new (G_VARIANT_TYPE ("a{sv}"));
-  g_autoptr(GVariant) metadata_v = NULL;
-
-  registry = flatpak_remote_state_new_oci_registry (self, token, cancellable, error);
-  if (registry == NULL)
-    return NULL;
 
   /* We extract the rev info from the latest, even if we don't use the latest digest, assuming refs don't move */
-  if (!flatpak_remote_state_lookup_ref (self, ref, &latest_rev, NULL, &latest_rev_info, NULL, error))
+  if (!flatpak_remote_state_lookup_ref_internal (self, ref, &latest_rev, NULL, &latest_rev_info, NULL, &image_source, error))
     return NULL;
 
   if (latest_rev == NULL)
@@ -1092,55 +1261,52 @@ flatpak_remote_state_fetch_commit_object_oci (FlatpakRemoteState *self,
       return NULL;
     }
 
-  metadata = var_ref_info_get_metadata (latest_rev_info);
-  oci_repository = var_metadata_lookup_string (metadata, "xa.oci-repository", NULL);
-
-  oci_digest = g_strconcat ("sha256:", checksum, NULL);
-
-  versioned = flatpak_oci_registry_load_versioned (registry, oci_repository, oci_digest,
-                                                   NULL, NULL, cancellable, error);
-  if (versioned == NULL)
-    return NULL;
-
-  if (!FLATPAK_IS_OCI_MANIFEST (versioned))
+  if (image_source == NULL)
     {
-      flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Image is not a manifest"));
-      return NULL;
+      VarMetadataRef metadata;
+      g_autofree char *oci_digest = NULL;
+      const char *oci_repository = NULL;
+      const char *delta_url = NULL;
+
+      metadata = var_ref_info_get_metadata (latest_rev_info);
+      oci_repository = var_metadata_lookup_string (metadata, "xa.oci-repository", NULL);
+      delta_url = var_metadata_lookup_string (metadata, "xa.delta-url", NULL);
+
+      oci_digest = g_strconcat ("sha256:", opt_rev ? opt_rev : latest_rev, NULL);
+
+      image_source = flatpak_remote_state_new_image_source (self, dir, oci_repository, oci_digest, token, cancellable, error);
+      if (image_source == NULL)
+        return NULL;
+
+      if (g_strcmp0 (flatpak_image_source_get_ref (image_source), ref) != 0)
+        {
+          flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Commit has no requested ref ‘%s’ in ref binding metadata"),  ref);
+          return NULL;
+        }
+
+      flatpak_image_source_set_delta_url (image_source, delta_url);
     }
 
-  image_config = flatpak_oci_registry_load_image_config (registry, oci_repository,
-                                                         FLATPAK_OCI_MANIFEST (versioned)->config.digest,
-                                                         (const char **)FLATPAK_OCI_MANIFEST (versioned)->config.urls,
-                                                         NULL, cancellable, error);
-  if (image_config == NULL)
+  return g_steal_pointer (&image_source);
+}
+
+
+static GVariant *
+flatpak_remote_state_fetch_commit_object_oci (FlatpakRemoteState *self,
+                                              FlatpakDir   *dir,
+                                              const char   *ref,
+                                              const char   *checksum,
+                                              const char   *token,
+                                              GCancellable *cancellable,
+                                              GError      **error)
+{
+  g_autoptr(FlatpakImageSource) image_source = NULL;
+
+  image_source = flatpak_remote_state_fetch_image_source (self, dir, ref, checksum, token, cancellable, error);
+  if (image_source == NULL)
     return NULL;
 
-  labels = flatpak_oci_image_get_labels (image_config);
-  if (labels)
-    flatpak_oci_parse_commit_labels (labels, &timestamp,
-                                     &subject, &body,
-                                     &manifest_ref, NULL, &parent,
-                                     metadata_builder);
-
-
-  if (g_strcmp0 (manifest_ref, ref) != 0)
-    {
-      flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Commit has no requested ref ‘%s’ in ref binding metadata"),  ref);
-      return NULL;
-    }
-
-  metadata_v = g_variant_ref_sink (g_variant_builder_end (metadata_builder));
-
-  /* This isn't going to be exactly the same as the reconstructed one from the pull, because we don't have the contents, but its useful to get metadata */
-  return
-    g_variant_ref_sink (g_variant_new ("(@a{sv}@ay@a(say)sst@ay@ay)",
-                                       metadata_v,
-                                       parent ? ostree_checksum_to_bytes_v (parent) :  g_variant_new_from_data (G_VARIANT_TYPE ("ay"), NULL, 0, FALSE, NULL, NULL),
-                                       g_variant_new_array (G_VARIANT_TYPE ("(say)"), NULL, 0),
-                                       subject, body,
-                                       GUINT64_TO_BE (timestamp),
-                                       ostree_checksum_to_bytes_v ("0000000000000000000000000000000000000000000000000000000000000000"),
-                                       ostree_checksum_to_bytes_v ("0000000000000000000000000000000000000000000000000000000000000000")));
+  return flatpak_image_source_make_fake_commit (image_source);
 }
 
 static GVariant *
@@ -1259,7 +1425,7 @@ flatpak_remote_state_load_ref_commit (FlatpakRemoteState *self,
 
   if (opt_commit == NULL)
     {
-      if (!flatpak_remote_state_lookup_ref (self, ref, &commit, NULL, NULL, NULL, error))
+      if (!flatpak_remote_state_lookup_ref (self, ref, &commit, NULL, NULL, NULL, NULL, error))
         return NULL;
 
       if (commit == NULL)
@@ -1277,12 +1443,26 @@ flatpak_remote_state_load_ref_commit (FlatpakRemoteState *self,
   if (ostree_repo_load_commit (dir->repo, commit, &commit_data, NULL, NULL))
     goto out;
 
-  for (int i = 0; i < self->sideload_repos->len; i++)
+  if (self->is_oci)
     {
-      FlatpakSideloadState *ss = g_ptr_array_index (self->sideload_repos, i);
+      g_autoptr(FlatpakImageSource) image_source;
 
-      if (ostree_repo_load_commit (ss->repo, commit, &commit_data, NULL, NULL))
-        goto out;
+      flatpak_remote_state_lookup_sideload_checksum (self, commit, NULL, &image_source);
+      if (image_source)
+        {
+          commit_data = flatpak_image_source_make_fake_commit (image_source);
+          goto out;
+        }
+    }
+  else
+    {
+      for (int i = 0; i < self->sideload_repos->len; i++)
+        {
+          FlatpakSideloadState *ss = g_ptr_array_index (self->sideload_repos, i);
+
+          if (ostree_repo_load_commit (ss->repo, commit, &commit_data, NULL, NULL))
+            goto out;
+        }
     }
 
   if (flatpak_dir_get_remote_oci (dir, self->remote_name))
@@ -1496,16 +1676,48 @@ flatpak_deploy_get_overrides (FlatpakDeploy *deploy)
   FlatpakContext *overrides = flatpak_context_new ();
 
   if (deploy->system_overrides)
-    flatpak_context_merge (overrides, deploy->system_overrides);
+    {
+      flatpak_context_dump (deploy->system_overrides,
+                            "System-wide overrides for all apps");
+      flatpak_context_merge (overrides, deploy->system_overrides);
+    }
+  else
+    {
+      g_debug ("No system-wide overrides for all apps");
+    }
 
   if (deploy->system_app_overrides)
-    flatpak_context_merge (overrides, deploy->system_app_overrides);
+    {
+      flatpak_context_dump (deploy->system_app_overrides,
+                            "System-wide overrides for specified app");
+      flatpak_context_merge (overrides, deploy->system_app_overrides);
+    }
+  else
+    {
+      g_debug ("No system-wide per-app overrides for specified app");
+    }
 
   if (deploy->user_overrides)
-    flatpak_context_merge (overrides, deploy->user_overrides);
+    {
+      flatpak_context_dump (deploy->user_overrides,
+                            "Per-user overrides for all apps");
+      flatpak_context_merge (overrides, deploy->user_overrides);
+    }
+  else
+    {
+      g_debug ("No per-user overrides for all apps");
+    }
 
   if (deploy->user_app_overrides)
-    flatpak_context_merge (overrides, deploy->user_app_overrides);
+    {
+      flatpak_context_dump (deploy->user_app_overrides,
+                            "Per-user overrides for specified app");
+      flatpak_context_merge (overrides, deploy->user_app_overrides);
+    }
+  else
+    {
+      g_debug ("No per-user overrides for specified app");
+    }
 
   return overrides;
 }
@@ -1536,20 +1748,24 @@ flatpak_deploy_new (GFile             *dir,
 GFile *
 flatpak_get_system_default_base_dir_location (void)
 {
-  static gsize path = 0;
+  static gsize file = 0;
 
-  if (g_once_init_enter (&path))
+  if (g_once_init_enter (&file))
     {
       gsize setup_value = 0;
+      const char *path;
       const char *system_dir = g_getenv ("FLATPAK_SYSTEM_DIR");
-      if (system_dir != NULL)
-        setup_value = (gsize) system_dir;
+      if (system_dir != NULL && *system_dir != 0)
+        path = system_dir;
       else
-        setup_value = (gsize) FLATPAK_SYSTEMDIR;
-      g_once_init_leave (&path, setup_value);
+        path = FLATPAK_SYSTEMDIR;
+
+      setup_value = (gsize) g_file_new_for_path (path);
+
+      g_once_init_leave (&file, setup_value);
     }
 
-  return g_file_new_for_path ((char *) path);
+  return g_object_ref ((GFile *) file);
 }
 
 static FlatpakDirStorageType
@@ -1839,6 +2055,405 @@ get_system_locations (GCancellable *cancellable,
   return g_steal_pointer (&locations);
 }
 
+typedef struct
+{
+  char *name;
+  char *branch;
+  gboolean is_runtime;
+  char *collection_id;
+  gboolean install;
+} PreinstallConfig;
+
+static PreinstallConfig *
+preinstall_config_new (const char *name)
+{
+  PreinstallConfig *config = g_new0 (PreinstallConfig, 1);
+
+  config->name = g_strdup (name);
+  config->branch = g_strdup ("master");
+  config->install = TRUE;
+
+  return config;
+}
+
+static void
+preinstall_config_free (PreinstallConfig *config)
+{
+  g_clear_pointer (&config->name, g_free);
+  g_clear_pointer (&config->branch, g_free);
+  g_clear_pointer (&config->collection_id, g_free);
+  g_free (config);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (PreinstallConfig, preinstall_config_free)
+
+static void
+flatpak_preinstall_config_free (FlatpakPreinstallConfig *preinstall)
+{
+  g_clear_pointer (&preinstall->ref, flatpak_decomposed_unref);
+  g_clear_pointer (&preinstall->collection_id, g_free);
+  g_free (preinstall);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (FlatpakPreinstallConfig, flatpak_preinstall_config_free)
+
+static void
+flatpak_parse_preinstall_config_file (GKeyFile   *keyfile,
+                                      GHashTable *configs)
+{
+  g_auto(GStrv) groups = NULL;
+
+  groups = g_key_file_get_groups (keyfile, NULL);
+
+  for (int i = 0; groups[i] != NULL; i++)
+    {
+      const char *group_name = groups[i];
+      const char *name;
+      g_autoptr(PreinstallConfig) config = NULL;
+      g_autoptr(GError) local_error = NULL;
+      g_autofree char *owned_name = NULL;
+      g_autofree char *branch = NULL;
+      gboolean is_runtime = FALSE;
+      g_autofree char *collection_id = NULL;
+      gboolean install = TRUE;
+
+      if (!g_str_has_prefix (group_name, FLATPAK_PREINSTALL_GROUP_PREFIX) ||
+          *(group_name + strlen (FLATPAK_PREINSTALL_GROUP_PREFIX)) == '\0')
+        {
+          g_info ("Skipping unknown group %s", group_name);
+          continue;
+        }
+
+      name = group_name + strlen (FLATPAK_PREINSTALL_GROUP_PREFIX);
+
+      if (!g_hash_table_steal_extended (configs, name,
+                                        (gpointer *)&owned_name,
+                                        (gpointer *)&config))
+        {
+          config = preinstall_config_new (name);
+          owned_name = g_strdup (name);
+        }
+
+      branch = g_key_file_get_string (keyfile,
+                                      group_name,
+                                      FLATPAK_PREINSTALL_BRANCH_KEY,
+                                      NULL);
+      if (branch)
+        {
+          if (*branch == '\0')
+            g_clear_pointer (&branch, g_free);
+
+          g_set_str (&config->branch, branch);
+        }
+
+      is_runtime = g_key_file_get_boolean (keyfile,
+                                           group_name,
+                                           FLATPAK_PREINSTALL_IS_RUNTIME_KEY,
+                                           &local_error);
+      if (!local_error)
+        {
+          config->is_runtime = is_runtime;
+        }
+      else if (!g_error_matches (local_error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_KEY_NOT_FOUND))
+        {
+          g_info ("Invalid file format, %s is not a boolean",
+                  FLATPAK_PREINSTALL_IS_RUNTIME_KEY);
+        }
+      g_clear_error (&local_error);
+
+      collection_id = g_key_file_get_string (keyfile,
+                                             group_name,
+                                             FLATPAK_PREINSTALL_COLLECTION_ID_KEY,
+                                             NULL);
+      if (collection_id)
+        {
+          if (*collection_id == '\0')
+            g_clear_pointer (&collection_id, g_free);
+
+          g_set_str (&config->collection_id, collection_id);
+        }
+
+      install = g_key_file_get_boolean (keyfile,
+                                        group_name,
+                                        FLATPAK_PREINSTALL_INSTALL_KEY,
+                                        &local_error);
+      if (!local_error)
+        {
+          config->install = install;
+        }
+      else if (!g_error_matches (local_error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_KEY_NOT_FOUND))
+        {
+          g_info ("Invalid file format, %s is not a boolean",
+                  FLATPAK_PREINSTALL_INSTALL_KEY);
+        }
+      g_clear_error (&local_error);
+
+      g_hash_table_insert (configs,
+                           g_steal_pointer (&owned_name),
+                           g_steal_pointer (&config));
+    }
+}
+
+typedef struct
+{
+  char *name;
+  GFile *file;
+} PreinstallConfigFile;
+
+static gint
+preinstall_config_file_sort (gconstpointer a,
+                             gconstpointer b)
+{
+  const PreinstallConfigFile *ca = a;
+  const PreinstallConfigFile *cb = b;
+
+  return g_strcmp0 (ca->name, cb->name);
+}
+
+static void
+preinstall_config_file_free (PreinstallConfigFile *preinstall_config_file)
+{
+  g_clear_pointer (&preinstall_config_file->name, g_free);
+  g_clear_object (&preinstall_config_file->file);
+  g_free (preinstall_config_file);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (PreinstallConfigFile, preinstall_config_file_free);
+
+static gboolean
+scan_preinstall_config_files (const char    *config_dir,
+                              GHashTable    *configs,
+                              GCancellable  *cancellable,
+                              GError       **error)
+{
+  g_autoptr(GFile) conf_dir = NULL;
+  g_autoptr(GFileEnumerator) dir_enum = NULL;
+  g_autoptr(GPtrArray) config_files = NULL;
+  g_autoptr(GError) local_error = NULL;
+
+  if (!g_file_test (config_dir, G_FILE_TEST_IS_DIR))
+    {
+      g_info ("Skipping missing preinstall config directory %s", config_dir);
+      return TRUE;
+    }
+
+  conf_dir = g_file_new_for_path (config_dir);
+  dir_enum = g_file_enumerate_children (conf_dir,
+                                        G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                                        G_FILE_QUERY_INFO_NONE,
+                                        cancellable,
+                                        &local_error);
+  if (local_error != NULL)
+    {
+      g_info ("Unexpected error retrieving preinstalls from %s: %s",
+              config_dir,
+              local_error->message);
+
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return FALSE;
+    }
+
+  config_files = g_ptr_array_new_with_free_func ((GDestroyNotify)preinstall_config_file_free);
+
+  while (TRUE)
+    {
+      GFileInfo *file_info;
+      GFile *path;
+      const char *name;
+      guint32 type;
+      g_autoptr(PreinstallConfigFile) config_file = NULL;
+
+      if (!g_file_enumerator_iterate (dir_enum,
+                                      &file_info,
+                                      &path,
+                                      cancellable,
+                                      &local_error))
+        {
+          g_info ("Unexpected error reading file in %s: %s",
+                  config_dir,
+                  local_error->message);
+
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return FALSE;
+        }
+
+      if (file_info == NULL)
+        break;
+
+      name = g_file_info_get_name (file_info);
+      type = g_file_info_get_file_type (file_info);
+
+      if (type != G_FILE_TYPE_REGULAR ||
+          !g_str_has_suffix (name, FLATPAK_PREINSTALL_FILE_EXT))
+        continue;
+
+      config_file = g_new0 (PreinstallConfigFile, 1);
+      config_file->name = g_strdup (name);
+      config_file->file = g_object_ref (path);
+      g_ptr_array_add (config_files, g_steal_pointer (&config_file));
+    }
+
+  g_ptr_array_sort (config_files, preinstall_config_file_sort);
+
+  for (int i = 0; i < config_files->len; i++)
+    {
+      PreinstallConfigFile *config_file = g_ptr_array_index (config_files, i);
+      g_autofree char *path = NULL;
+      g_autoptr(GKeyFile) keyfile = NULL;
+      g_autoptr(GError) load_error = NULL;
+
+      path = g_file_get_path (config_file->file);
+
+      g_info ("Parsing config file %s", path);
+
+      keyfile = g_key_file_new ();
+
+      if (!g_key_file_load_from_file (keyfile, path, G_KEY_FILE_NONE, &load_error))
+        g_info ("Parsing config file %s failed: %s", path, load_error->message);
+
+      flatpak_parse_preinstall_config_file (keyfile, configs);
+    }
+
+  return TRUE;
+}
+
+GPtrArray *
+flatpak_get_preinstall_config (const char    *default_arch,
+                               GCancellable  *cancellable,
+                               GError       **error)
+{
+  g_autoptr(GHashTable) configs = NULL;
+  g_autoptr(GPtrArray) preinstalls = NULL;
+  g_autofree char *config_dir = NULL;
+  g_autofree char *data_dir = NULL;
+  GHashTableIter iter;
+  PreinstallConfig *config;
+
+  configs = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                   g_free, (GDestroyNotify)preinstall_config_free);
+
+  /* scan directories in reverse priority order */
+  data_dir = g_build_filename (get_data_dir_location (), FLATPAK_PREINSTALL_DIR, NULL);
+  if (!scan_preinstall_config_files (data_dir, configs, cancellable, error))
+    return NULL;
+
+  config_dir = g_build_filename (get_config_dir_location (), FLATPAK_PREINSTALL_DIR, NULL);
+  if (!scan_preinstall_config_files (config_dir, configs, cancellable, error))
+    return NULL;
+
+  preinstalls = g_ptr_array_new_with_free_func ((GDestroyNotify)flatpak_preinstall_config_free);
+
+  g_hash_table_iter_init (&iter, configs);
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *)&config))
+    {
+      g_autoptr(FlatpakPreinstallConfig) preinstall = NULL;
+      g_autoptr(FlatpakDecomposed) ref = NULL;
+      g_autoptr(GError) local_error = NULL;
+
+      if (!config->install)
+        {
+          g_info ("Skipping preinstall of %s because it is configured to not install",
+                  config->name);
+          continue;
+        }
+
+      ref = flatpak_decomposed_new_from_parts (config->is_runtime ?
+                                                 FLATPAK_KINDS_RUNTIME :
+                                                 FLATPAK_KINDS_APP,
+                                               config->name,
+                                               default_arch,
+                                               config->branch,
+                                               &local_error);
+      if (ref == NULL)
+        {
+          g_info ("Skipping preinstall of %s because of problems in the configuration: %s",
+                  config->name,
+                  local_error->message);
+          continue;
+        }
+
+      preinstall = g_new0 (FlatpakPreinstallConfig, 1);
+      preinstall->ref = g_steal_pointer (&ref);
+      preinstall->collection_id = g_strdup (config->collection_id);
+
+      g_info ("Found preinstall ref %s",
+              flatpak_decomposed_get_ref (preinstall->ref));
+
+      g_ptr_array_add (preinstalls, g_steal_pointer (&preinstall));
+    }
+
+  return g_steal_pointer (&preinstalls);
+}
+
+static gboolean
+flatpak_is_ref_in_list (FlatpakDecomposed *needle,
+                        GPtrArray         *refs)
+{
+  for (size_t i = 0; i < refs->len; i++)
+    {
+      FlatpakDecomposed *ref = g_ptr_array_index (refs, i);
+
+      if (flatpak_decomposed_equal (ref, needle))
+        return TRUE;
+    }
+
+  return FALSE;
+}
+
+gboolean
+flatpak_dir_uninitialized_mark_preinstalled (FlatpakDir       *self,
+                                             const GPtrArray  *preinstall_config,
+                                             GError          **error)
+{
+  g_autoptr(GPtrArray) installed_refs = NULL;
+  g_autofree char *existing_preinstalls = NULL;
+  g_autoptr(GError) local_error = NULL;
+
+  existing_preinstalls = flatpak_dir_get_config (self,
+                                                 "preinstalled",
+                                                 &local_error);
+
+  if (existing_preinstalls != NULL)
+    return TRUE;
+
+  if (!g_error_matches (local_error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_KEY_NOT_FOUND))
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return FALSE;
+    }
+
+  g_clear_error (&local_error);
+
+  installed_refs = flatpak_dir_list_refs (self, FLATPAK_KINDS_RUNTIME | FLATPAK_KINDS_APP,
+                                          NULL, error);
+  if (installed_refs == NULL)
+    return FALSE;
+
+  for (int i = 0; i < preinstall_config->len; i++)
+    {
+      const FlatpakPreinstallConfig *config = g_ptr_array_index (preinstall_config, i);
+      GError **append_error = local_error == NULL ? &local_error : NULL;
+
+      if (!flatpak_is_ref_in_list (config->ref, installed_refs))
+        continue;
+
+      flatpak_dir_config_append_pattern (self,
+                                         "preinstalled",
+                                         flatpak_decomposed_get_ref (config->ref),
+                                         FALSE,
+                                         NULL,
+                                         append_error);
+    }
+
+  if (local_error)
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
 GPtrArray *
 flatpak_get_system_base_dir_locations (GCancellable *cancellable,
                                        GError      **error)
@@ -1996,6 +2611,24 @@ flatpak_ensure_user_cache_dir_location (GError **error)
     }
 
   return g_steal_pointer (&cache_dir);
+}
+
+static char *
+flatpak_dir_get_os_info (FlatpakDir *self)
+{
+  g_autofree char *os_report_config = NULL;
+  g_autofree char *os_id = NULL;
+  g_autofree char *os_version = NULL;
+
+  os_report_config = flatpak_dir_get_config (self, "report-os-info", NULL);
+
+  if (g_strcmp0 (os_report_config, "false") == 0)
+    return NULL;
+
+  os_id = flatpak_get_os_release_id ();
+  os_version = flatpak_get_os_release_version_id ();
+
+  return g_strdup_printf ("%s;%s;%s", os_id, os_version, flatpak_get_arch ());
 }
 
 static GFile *
@@ -2595,6 +3228,7 @@ flatpak_dir_finalize (GObject *object)
   g_clear_pointer (&self->remote_filters, g_hash_table_unref);
   g_clear_pointer (&self->masked, g_regex_unref);
   g_clear_pointer (&self->pinned, g_regex_unref);
+  g_clear_object (&self->subject);
 
   G_OBJECT_CLASS (flatpak_dir_parent_class)->finalize (object);
 }
@@ -3876,52 +4510,37 @@ copy_remote_config (GKeyFile *config,
     }
 }
 
-static GHashTable *
-_flatpak_dir_find_new_flatpakrepos (FlatpakDir *self, OstreeRepo *repo)
+static void
+_flatpak_dir_scan_new_flatpakrepos (const char          *dir_str,
+                                    GHashTable         **flatpakrepos,
+                                    const char * const  *remotes)
 {
-  g_autoptr(GHashTable) flatpakrepos = NULL;
-  g_autoptr(GFile) conf_dir = NULL;
+  g_autoptr(GFile) dir = NULL;
   g_autoptr(GFileEnumerator) dir_enum = NULL;
-  g_autoptr(GError) my_error = NULL;
-  g_autofree char *config_dir = NULL;
-  g_auto(GStrv) remotes = NULL;
-  g_auto(GStrv) applied_remotes = NULL;
 
-  g_assert (repo != NULL);
+  g_return_if_fail (dir_str != NULL);
+  g_return_if_fail (flatpakrepos != NULL);
 
-  /* Predefined remotes only applies for the default system installation */
-  if (self->user ||
-      (self->extra_data != NULL &&
-       strcmp (self->extra_data->id, SYSTEM_DIR_DEFAULT_ID) != 0))
-    return NULL;
-
-  config_dir = g_strdup_printf ("%s/%s",
-                                get_config_dir_location (),
-                                SYSCONF_REMOTES_DIR);
-  conf_dir = g_file_new_for_path (config_dir);
-  dir_enum = g_file_enumerate_children (conf_dir,
+  dir = g_file_new_for_path (dir_str);
+  dir_enum = g_file_enumerate_children (dir,
                                         G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE,
                                         G_FILE_QUERY_INFO_NONE,
-                                        NULL, &my_error);
-  if (my_error != NULL)
-    return NULL;
-
-  remotes = ostree_repo_remote_list (repo, NULL);
-  applied_remotes = g_key_file_get_string_list (ostree_repo_get_config (repo),
-                                                "core", "xa.applied-remotes", NULL, NULL);
+                                        NULL, NULL);
+  if (dir_enum == NULL)
+    return;
 
   while (TRUE)
     {
       GFileInfo *file_info;
-      GFile *path;
       const char *name;
       guint32 type;
+      g_autoptr(GError) local_error = NULL;
 
-      if (!g_file_enumerator_iterate (dir_enum, &file_info, &path,
-                                      NULL, &my_error))
+      if (!g_file_enumerator_iterate (dir_enum, &file_info, NULL,
+                                      NULL, &local_error))
         {
           g_info ("Unexpected error reading file in %s: %s",
-                  config_dir, my_error->message);
+                  dir_str, local_error->message);
           break;
         }
 
@@ -3931,22 +4550,58 @@ _flatpak_dir_find_new_flatpakrepos (FlatpakDir *self, OstreeRepo *repo)
       name = g_file_info_get_name (file_info);
       type = g_file_info_get_file_type (file_info);
 
-      if (type == G_FILE_TYPE_REGULAR && g_str_has_suffix (name, SYSCONF_REMOTES_FILE_EXT))
+      if (type == G_FILE_TYPE_REGULAR && g_str_has_suffix (name, FLATPAK_REMOTES_FILE_EXT))
         {
-          g_autofree char *remote_name = g_strndup (name, strlen (name) - strlen (SYSCONF_REMOTES_FILE_EXT));
+          g_autofree char *remote_name = g_strndup (name, strlen (name) - strlen (FLATPAK_REMOTES_FILE_EXT));
 
-          if (remotes && g_strv_contains ((const char * const *)remotes, remote_name))
+          if (remotes && g_strv_contains (remotes, remote_name))
             continue;
 
-          if (applied_remotes && g_strv_contains ((const char * const *)applied_remotes, remote_name))
-            continue;
+          if (*flatpakrepos == NULL)
+            *flatpakrepos = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_object_unref);
 
-          if (flatpakrepos == NULL)
-            flatpakrepos = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_object_unref);
-
-          g_hash_table_insert (flatpakrepos, g_steal_pointer (&remote_name), g_file_enumerator_get_child (dir_enum, file_info));
+          g_hash_table_insert (*flatpakrepos, g_steal_pointer (&remote_name), g_file_enumerator_get_child (dir_enum, file_info));
         }
     }
+}
+
+static GHashTable *
+_flatpak_dir_find_new_flatpakrepos (FlatpakDir *self, OstreeRepo *repo)
+{
+  g_autoptr(GHashTable) flatpakrepos = NULL;
+  g_autofree char *config_dir_str = NULL;
+  g_autofree char *os_config_dir_str = NULL;
+  g_auto(GStrv) ostree_remotes = NULL;
+  g_auto(GStrv) applied_remotes = NULL;
+  g_autoptr(GPtrArray) remotes = NULL;
+
+  g_assert (repo != NULL);
+
+  /* Predefined remotes only applies for the default system installation */
+  if (self->user ||
+      (self->extra_data &&
+       g_strcmp0 (self->extra_data->id, SYSTEM_DIR_DEFAULT_ID) != 0))
+    return NULL;
+
+  ostree_remotes = ostree_repo_remote_list (repo, NULL);
+  applied_remotes = g_key_file_get_string_list (ostree_repo_get_config (repo),
+                                                "core", "xa.applied-remotes", NULL, NULL);
+  remotes = g_ptr_array_new ();
+  for (int i = 0; ostree_remotes && ostree_remotes[i]; i++)
+    g_ptr_array_add (remotes, ostree_remotes[i]);
+  for (int i = 0; applied_remotes && applied_remotes[i]; i++)
+    g_ptr_array_add (remotes, applied_remotes[i]);
+  g_ptr_array_add (remotes, NULL);
+
+  config_dir_str = g_build_filename (get_config_dir_location (), FLATPAK_REMOTES_DIR, NULL);
+  _flatpak_dir_scan_new_flatpakrepos (config_dir_str,
+                                      &flatpakrepos,
+                                      (const char * const *) remotes->pdata);
+
+  os_config_dir_str = g_build_filename (get_data_dir_location (), FLATPAK_REMOTES_DIR, NULL);
+  _flatpak_dir_scan_new_flatpakrepos (os_config_dir_str,
+                                      &flatpakrepos,
+                                      (const char * const *) remotes->pdata);
 
   return g_steal_pointer (&flatpakrepos);
 }
@@ -4377,6 +5032,9 @@ flatpak_dir_set_config (FlatpakDir *self,
                                                      flags, key, value,
                                                      installation ? installation : "",
                                                      NULL, error))
+        return FALSE;
+
+      if (!_flatpak_dir_reload_config (self, NULL, error))
         return FALSE;
 
       return TRUE;
@@ -4937,6 +5595,7 @@ flatpak_dir_find_latest_rev (FlatpakDir               *self,
                              char                    **out_rev,
                              guint64                  *out_timestamp,
                              GFile                   **out_sideload_path,
+                             FlatpakImageSource      **out_image_source,
                              GCancellable             *cancellable,
                              GError                  **error)
 {
@@ -4944,7 +5603,7 @@ flatpak_dir_find_latest_rev (FlatpakDir               *self,
 
   g_return_val_if_fail (out_rev != NULL, FALSE);
 
-  if (!flatpak_remote_state_lookup_ref (state, ref, &latest_rev, out_timestamp, NULL, out_sideload_path, error))
+  if (!flatpak_remote_state_lookup_ref (state, ref, &latest_rev, out_timestamp, NULL, out_sideload_path, out_image_source, error))
     return FALSE;
   if (latest_rev == NULL)
     return flatpak_fail_error (error, FLATPAK_ERROR_REF_NOT_FOUND,
@@ -5189,10 +5848,10 @@ flatpak_dir_update_appstream (FlatpakDir          *self,
   used_branch = new_branch;
   if (!is_oci)
     {
-      if (!flatpak_dir_find_latest_rev (self, state, used_branch, NULL, &appstream_commit, NULL, &appstream_sideload_path, cancellable, &first_error))
+      if (!flatpak_dir_find_latest_rev (self, state, used_branch, NULL, &appstream_commit, NULL, &appstream_sideload_path, NULL, cancellable, &first_error))
         {
           used_branch = old_branch;
-          if (!flatpak_dir_find_latest_rev (self, state, used_branch, NULL, &appstream_commit, NULL, &appstream_sideload_path, cancellable, &second_error))
+          if (!flatpak_dir_find_latest_rev (self, state, used_branch, NULL, &appstream_commit, NULL, &appstream_sideload_path, NULL, cancellable, &second_error))
             {
               g_prefix_error (&first_error, "Error updating appstream2: ");
               g_prefix_error (&second_error, "Error updating appstream: ");
@@ -5252,7 +5911,7 @@ flatpak_dir_update_appstream (FlatpakDir          *self,
           if (child_repo == NULL)
             return FALSE;
 
-          if (!flatpak_dir_pull (self, state, used_branch, appstream_commit, NULL, appstream_sideload_path, NULL, NULL,
+          if (!flatpak_dir_pull (self, state, used_branch, appstream_commit, NULL, appstream_sideload_path, NULL, NULL, NULL,
                                  child_repo, FLATPAK_PULL_FLAGS_NONE, 0,
                                  progress, cancellable, error))
             {
@@ -5296,7 +5955,7 @@ flatpak_dir_update_appstream (FlatpakDir          *self,
     }
 
 
-  if (!flatpak_dir_pull (self, state, used_branch, appstream_commit, NULL, appstream_sideload_path, NULL, NULL, NULL,
+  if (!flatpak_dir_pull (self, state, used_branch, appstream_commit, NULL, appstream_sideload_path, NULL, NULL, NULL, NULL,
                          FLATPAK_PULL_FLAGS_NONE, OSTREE_REPO_PULL_FLAGS_NONE, progress,
                          cancellable, error))
     {
@@ -5348,7 +6007,8 @@ get_common_pull_options (GVariantBuilder     *builder,
                          const char          *current_local_checksum,
                          gboolean             force_disable_deltas,
                          OstreeRepoPullFlags  flags,
-                         FlatpakProgress     *progress)
+                         FlatpakProgress     *progress,
+                         FlatpakDir          *dir)
 {
   guint32 update_interval = 0;
   GVariantBuilder hdr_builder;
@@ -5390,6 +6050,13 @@ get_common_pull_options (GVariantBuilder     *builder,
     }
   if (current_local_checksum)
     g_variant_builder_add (&hdr_builder, "(ss)", "Flatpak-Upgrade-From", current_local_checksum);
+
+  {
+    g_autofree char *os_info = flatpak_dir_get_os_info (dir);
+    if (os_info)
+      g_variant_builder_add (&hdr_builder, "(ss)", "Flatpak-Os-Info", os_info);
+  }
+
   g_variant_builder_add (builder, "{s@v}", "http-headers",
                          g_variant_new_variant (g_variant_builder_end (&hdr_builder)));
   g_variant_builder_add (builder, "{s@v}", "append-user-agent",
@@ -5428,6 +6095,7 @@ repo_pull (OstreeRepo                           *self,
            FlatpakPullFlags                      flatpak_flags,
            OstreeRepoPullFlags                   flags,
            FlatpakProgress                      *progress,
+           FlatpakDir                           *dir,
            GCancellable                         *cancellable,
            GError                              **error)
 {
@@ -5463,7 +6131,7 @@ repo_pull (OstreeRepo                           *self,
   /* Pull options */
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("a{sv}"));
   get_common_pull_options (&builder, state, ref_to_fetch, token, dirs_to_pull, current_checksum,
-                           force_disable_deltas, flags, progress);
+                           force_disable_deltas, flags, progress, dir);
 
   if (sideload_repo)
     {
@@ -5568,16 +6236,14 @@ extra_data_progress_report (guint64  downloaded_bytes,
 }
 
 static void
-compute_extra_data_download_size (GVariant *commitv,
-                                  guint64 *out_n_extra_data,
-                                  guint64 *out_total_download_size)
+compute_extra_data_download_size (GVariant *extra_data_sources,
+                                  guint64  *out_n_extra_data,
+                                  guint64  *out_total_download_size)
 {
   guint64 i;
   guint64 n_extra_data = 0;
   guint64 total_download_size = 0;
-  g_autoptr(GVariant) extra_data_sources = NULL;
 
-  extra_data_sources = flatpak_commit_get_extra_data_sources (commitv, NULL);
   if (extra_data_sources != NULL)
     {
       n_extra_data = g_variant_n_children (extra_data_sources);
@@ -5604,7 +6270,6 @@ flatpak_dir_setup_extra_data (FlatpakDir                           *self,
                               OstreeRepo                           *repo,
                               const char                           *ref,
                               const char                           *rev,
-                              GFile                                *sideload_repo,
                               const char                           *token,
                               FlatpakPullFlags                      flatpak_flags,
                               FlatpakProgress                      *progress,
@@ -5646,11 +6311,16 @@ flatpak_dir_setup_extra_data (FlatpakDir                           *self,
       else
         {
           /* No summary/cache or old cache version, download commit and get size from there */
-          g_autoptr(GVariant) commitv = flatpak_remote_state_load_ref_commit (state, self, ref, rev, token, NULL, cancellable, error);
+          g_autoptr(GVariant) commitv = NULL;
+          g_autoptr(GVariant) extra_data_sources = NULL;
+
+          commitv = flatpak_remote_state_load_ref_commit (state, self, ref, rev,
+                                                          token, NULL, cancellable, error);
           if (commitv == NULL)
             return FALSE;
 
-          compute_extra_data_download_size (commitv, &n_extra_data, &total_download_size);
+          extra_data_sources = flatpak_commit_get_extra_data_sources (commitv, NULL);
+          compute_extra_data_download_size (extra_data_sources, &n_extra_data, &total_download_size);
         }
     }
 
@@ -5664,156 +6334,267 @@ flatpak_dir_setup_extra_data (FlatpakDir                           *self,
 }
 
 static gboolean
-flatpak_dir_pull_extra_data (FlatpakDir          *self,
-                             OstreeRepo          *repo,
-                             const char          *repository,
-                             const char          *ref,
-                             const char          *rev,
-                             FlatpakPullFlags     flatpak_flags,
-                             FlatpakProgress     *progress,
-                             GCancellable        *cancellable,
-                             GError             **error)
+flatpak_dir_pull_extra_data_to_bytes (FlatpakDir       *self,
+                                      GVariant         *extra_data_sources,
+                                      int               extra_data_index,
+                                      FlatpakProgress  *progress,
+                                      GBytes          **bytes_out,
+                                      const char      **name_out,
+                                      GCancellable     *cancellable,
+                                      GError          **error)
 {
-  g_autoptr(GVariant) extra_data_sources = NULL;
-  g_autoptr(GVariant) detached_metadata = NULL;
-  g_auto(GVariantDict) new_metadata_dict = FLATPAK_VARIANT_DICT_INITIALIZER;
-  g_autoptr(GVariantBuilder) extra_data_builder = NULL;
-  g_autoptr(GVariant) new_detached_metadata = NULL;
-  g_autoptr(GVariant) extra_data = NULL;
+  const char *name = NULL;
+  guint64 download_size;
+  guint64 installed_size;
+  const guchar *expected_sha256_bytes;
+  const char *uri = NULL;
+  g_autofree char *expected_sha256 = NULL;
+  g_autofree char *actual_sha256 = NULL;
+  g_autoptr(GBytes) bytes = NULL;
+  g_autoptr(GFile) extra_local_file = NULL;
   g_autoptr(GFile) base_dir = NULL;
-  int i;
-  gsize n_extra_data;
 
-  extra_data_sources = flatpak_repo_get_extra_data_sources (repo, rev, cancellable, NULL);
-  if (extra_data_sources == NULL)
-    return TRUE;
+  flatpak_repo_parse_extra_data_sources (extra_data_sources,
+                                         extra_data_index,
+                                         &name,
+                                         &download_size,
+                                         &installed_size,
+                                         &expected_sha256_bytes,
+                                         &uri);
+
+  if (expected_sha256_bytes == NULL)
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                 _("Invalid checksum for extra data uri %s"),
+                                 uri);
+    }
+
+  expected_sha256 = ostree_checksum_from_bytes (expected_sha256_bytes);
+
+  if (name == NULL || *name == '\0')
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                 _("Empty name for extra data uri %s"), uri);
+    }
+
+  /* Don't allow file uris here as that could read local files based on remote data */
+  if (!g_str_has_prefix (uri, "http:") &&
+      !g_str_has_prefix (uri, "https:"))
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                 _("Unsupported extra data uri %s"), uri);
+    }
+
+  /* TODO: Download to disk to support resumed downloads on error */
+
+  base_dir = flatpak_get_user_base_dir_location ();
+  extra_local_file = flatpak_build_file (base_dir,
+                                         "extra-data",
+                                         expected_sha256,
+                                         name,
+                                         NULL);
+
+  if (g_file_query_exists (extra_local_file, cancellable))
+    {
+      gsize extra_local_size;
+      g_autofree char *extra_local_contents = NULL;
+      g_autoptr(GError) local_error = NULL;
+
+      g_info ("Loading extra-data from local file %s",
+              flatpak_file_get_path_cached (extra_local_file));
+
+      if (!g_file_load_contents (extra_local_file,
+                                 cancellable,
+                                 &extra_local_contents,
+                                 &extra_local_size,
+                                 NULL,
+                                 &local_error))
+        {
+          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                     _("Failed to load local extra-data %s: %s"),
+                                     flatpak_file_get_path_cached (extra_local_file),
+                                     local_error->message);
+        }
+
+      if (extra_local_size != download_size)
+        {
+          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                     _("Wrong size for extra-data %s"),
+                                     flatpak_file_get_path_cached (extra_local_file));
+        }
+
+      bytes = g_bytes_new (extra_local_contents, extra_local_size);
+    }
+  else
+    {
+      ensure_http_session (self);
+      bytes = flatpak_load_uri (self->http_session,
+                                uri,
+                                0, NULL,
+                                extra_data_progress_report,
+                                progress,
+                                NULL,
+                                cancellable, error);
+
+      if (bytes == NULL)
+        {
+          g_prefix_error (error, _("While downloading %s: "), uri);
+          return FALSE;
+        }
+    }
+
+  g_assert (bytes != NULL);
+
+  if (g_bytes_get_size (bytes) != download_size)
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                 _("Wrong size for extra data %s"), uri);
+    }
+
+  flatpak_progress_complete_extra_data_download (progress, download_size);
+
+  actual_sha256 = g_compute_checksum_for_bytes (G_CHECKSUM_SHA256, bytes);
+  if (strcmp (actual_sha256, expected_sha256) != 0)
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                 _("Invalid checksum for extra data %s"), uri);
+    }
+
+  if (bytes_out)
+    *bytes_out = g_steal_pointer (&bytes);
+  if (name_out)
+    *name_out = name;
+  return TRUE;
+}
+
+static gboolean
+flatpak_dir_pull_extra_data (FlatpakDir       *self,
+                             GVariant         *extra_data_sources,
+                             FlatpakProgress  *progress,
+                             GPtrArray        *extra_data_out,
+                             GPtrArray        *names_out,
+                             GCancellable     *cancellable,
+                             GError          **error)
+{
+  gsize n_extra_data;
 
   n_extra_data = g_variant_n_children (extra_data_sources);
   if (n_extra_data == 0)
     return TRUE;
 
-  if ((flatpak_flags & FLATPAK_PULL_FLAGS_DOWNLOAD_EXTRA_DATA) == 0)
-    return flatpak_fail_error (error, FLATPAK_ERROR_UNTRUSTED, _("Extra data not supported for non-gpg-verified local system installs"));
-
-  extra_data_builder = g_variant_builder_new (G_VARIANT_TYPE ("a(ayay)"));
-
   /* Other fields were already set in flatpak_dir_setup_extra_data() */
   flatpak_progress_start_extra_data (progress);
 
-  base_dir = flatpak_get_user_base_dir_location ();
-
-  for (i = 0; i < n_extra_data; i++)
+  for (size_t i = 0; i < n_extra_data; i++)
     {
-      const char *extra_data_uri = NULL;
-      g_autofree char *extra_data_sha256 = NULL;
-      const char *extra_data_name = NULL;
-      guint64 download_size;
-      guint64 installed_size;
-      g_autofree char *sha256 = NULL;
-      const guchar *sha256_bytes;
       g_autoptr(GBytes) bytes = NULL;
-      g_autoptr(GFile) extra_local_file = NULL;
+      const char *name = NULL;
 
-      flatpak_repo_parse_extra_data_sources (extra_data_sources, i,
-                                             &extra_data_name,
-                                             &download_size,
-                                             &installed_size,
-                                             &sha256_bytes,
-                                             &extra_data_uri);
-
-      if (sha256_bytes == NULL)
-        return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Invalid checksum for extra data uri %s"), extra_data_uri);
-
-      extra_data_sha256 = ostree_checksum_from_bytes (sha256_bytes);
-
-      if (*extra_data_name == 0)
-        return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Empty name for extra data uri %s"), extra_data_uri);
-
-      /* Don't allow file uris here as that could read local files based on remote data */
-      if (!g_str_has_prefix (extra_data_uri, "http:") &&
-          !g_str_has_prefix (extra_data_uri, "https:"))
+      if (!flatpak_dir_pull_extra_data_to_bytes (self,
+                                                 extra_data_sources,
+                                                 i,
+                                                 progress,
+                                                 &bytes,
+                                                 &name,
+                                                 cancellable,
+                                                 error))
         {
           flatpak_progress_reset_extra_data (progress);
-          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Unsupported extra data uri %s"), extra_data_uri);
-        }
-
-      /* TODO: Download to disk to support resumed downloads on error */
-
-      extra_local_file = flatpak_build_file (base_dir, "extra-data", extra_data_sha256, extra_data_name, NULL);
-      if (g_file_query_exists (extra_local_file, cancellable))
-        {
-          g_info ("Loading extra-data from local file %s", flatpak_file_get_path_cached (extra_local_file));
-          gsize extra_local_size;
-          g_autofree char *extra_local_contents = NULL;
-          g_autoptr(GError) my_error = NULL;
-
-          if (!g_file_load_contents (extra_local_file, cancellable, &extra_local_contents, &extra_local_size, NULL, &my_error))
-            return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Failed to load local extra-data %s: %s"),
-                                       flatpak_file_get_path_cached (extra_local_file), my_error->message);
-          if (extra_local_size != download_size)
-            return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Wrong size for extra-data %s"), flatpak_file_get_path_cached (extra_local_file));
-
-          bytes = g_bytes_new (extra_local_contents, extra_local_size);
-        }
-      else
-        {
-          ensure_http_session (self);
-          bytes = flatpak_load_uri (self->http_session, extra_data_uri, 0, NULL,
-                                    extra_data_progress_report, progress, NULL,
-                                    cancellable, error);
-        }
-
-      if (bytes == NULL)
-        {
-          flatpak_progress_reset_extra_data (progress);
-          g_prefix_error (error, _("While downloading %s: "), extra_data_uri);
           return FALSE;
         }
 
-      if (g_bytes_get_size (bytes) != download_size)
-        {
-          flatpak_progress_reset_extra_data (progress);
-          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Wrong size for extra data %s"), extra_data_uri);
-        }
+      if (extra_data_out)
+        g_ptr_array_add (extra_data_out, g_steal_pointer (&bytes));
+      if (names_out)
+        g_ptr_array_add (names_out, g_strdup (name));
+    }
 
-      flatpak_progress_complete_extra_data_download (progress, download_size);
+  flatpak_progress_reset_extra_data (progress);
 
-      sha256 = g_compute_checksum_for_bytes (G_CHECKSUM_SHA256, bytes);
-      if (strcmp (sha256, extra_data_sha256) != 0)
-        {
-          flatpak_progress_reset_extra_data (progress);
-          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Invalid checksum for extra data %s"), extra_data_uri);
-        }
+  return TRUE;
+}
+
+static gboolean
+flatpak_dir_pull_ostree_extra_data (FlatpakDir        *self,
+                                    OstreeRepo        *repo,
+                                    const char        *repository,
+                                    const char        *ref,
+                                    const char        *rev,
+                                    FlatpakPullFlags   flatpak_flags,
+                                    FlatpakProgress   *progress,
+                                    GCancellable      *cancellable,
+                                    GError           **error)
+{
+  g_autoptr(GVariant) extra_data_sources = NULL;
+  g_autoptr(GPtrArray) extra_data = NULL;
+  g_autoptr(GPtrArray) names = NULL;
+  g_autoptr(GVariantBuilder) extra_data_builder = NULL;
+  g_autoptr(GVariant) detached_metadata = NULL;
+  g_auto(GVariantDict) new_metadata_dict = FLATPAK_VARIANT_DICT_INITIALIZER;
+  g_autoptr(GVariant) new_detached_metadata = NULL;
+
+  extra_data_sources = flatpak_repo_get_extra_data_sources (repo, rev,
+                                                            cancellable, NULL);
+  if (extra_data_sources == NULL)
+    return TRUE;
+
+  if ((flatpak_flags & FLATPAK_PULL_FLAGS_DOWNLOAD_EXTRA_DATA) == 0)
+    {
+      return flatpak_fail_error (error, FLATPAK_ERROR_UNTRUSTED,
+                                 _("Extra data not supported for non-gpg-verified local system installs"));
+    }
+
+  extra_data = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+  names = g_ptr_array_new_with_free_func (g_free);
+
+  if (!flatpak_dir_pull_extra_data (self,
+                                    extra_data_sources,
+                                    progress,
+                                    extra_data,
+                                    names,
+                                    cancellable,
+                                    error))
+    return FALSE;
+
+  extra_data_builder = g_variant_builder_new (G_VARIANT_TYPE ("a(ayay)"));
+
+  for (size_t i = 0; i < extra_data->len; i++)
+    {
+      GBytes *bytes = g_ptr_array_index (extra_data, i);
+      const char *name = g_ptr_array_index (names, i);
 
       g_variant_builder_add (extra_data_builder,
                              "(^ay@ay)",
-                             extra_data_name,
-                             g_variant_new_from_bytes (G_VARIANT_TYPE ("ay"), bytes, TRUE));
+                             name,
+                             g_variant_new_from_bytes (G_VARIANT_TYPE ("ay"),
+                                                       bytes, TRUE));
     }
-
-  extra_data = g_variant_ref_sink (g_variant_builder_end (extra_data_builder));
-
-  flatpak_progress_reset_extra_data (progress);
 
   if (!ostree_repo_read_commit_detached_metadata (repo, rev, &detached_metadata,
                                                   cancellable, error))
     return FALSE;
 
   g_variant_dict_init (&new_metadata_dict, detached_metadata);
-  g_variant_dict_insert_value (&new_metadata_dict, "xa.extra-data", extra_data);
+  g_variant_dict_insert_value (&new_metadata_dict, "xa.extra-data",
+                               g_variant_builder_end (extra_data_builder));
   new_detached_metadata = g_variant_ref_sink (g_variant_dict_end (&new_metadata_dict));
 
   /* There is a commitmeta size limit when pulling, so we have to side-load it
      when installing in the system repo */
   if (flatpak_flags & FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA)
     {
-      int dfd =  ostree_repo_get_dfd (repo);
-      g_autoptr(GVariant) normalized = g_variant_get_normal_form (new_detached_metadata);
-      gsize normalized_size = g_variant_get_size (normalized);
-      const guint8 *data = g_variant_get_data (normalized);
+      int dfd;
+      g_autoptr(GVariant) normalized = NULL;
+      gsize normalized_size;
+      const guint8 *data;
       g_autofree char *filename = NULL;
 
+      dfd =  ostree_repo_get_dfd (repo);
+      normalized = g_variant_get_normal_form (new_detached_metadata);
+      normalized_size = g_variant_get_size (normalized);
+      data = g_variant_get_data (normalized);
       filename = g_strconcat (rev, ".commitmeta", NULL);
+
       if (!glnx_file_replace_contents_at (dfd, filename,
                                           data, normalized_size,
                                           0, cancellable, error))
@@ -5824,10 +6605,171 @@ flatpak_dir_pull_extra_data (FlatpakDir          *self,
     }
   else
     {
-      if (!ostree_repo_write_commit_detached_metadata (repo, rev, new_detached_metadata,
+      if (!ostree_repo_write_commit_detached_metadata (repo, rev,
+                                                       new_detached_metadata,
                                                        cancellable, error))
         return FALSE;
     }
+
+  return TRUE;
+}
+
+/* Extra-data usually is downloaded on the user side into an ostree repo.
+ * For system installs, a temporary ostree repo is used on the user side
+ * and then imported on the system side. This doesn't work for OCI images
+ * because importing the image into an ostree repo makes it impossible for
+ * the system side to verify the data.
+ *
+ * So instead, the OCI image is first mirrored into a local OCI repo and
+ * then gets imported on the system side, which can verify the image from
+ * the index by the digest.
+ */
+static gboolean
+flatpak_dir_mirror_oci_extra_data (FlatpakDir          *self,
+                                   FlatpakOciRegistry  *dst_registry,
+                                   FlatpakImageSource  *image_source,
+                                   FlatpakProgress     *progress,
+                                   GCancellable        *cancellable,
+                                   GError             **error)
+{
+  g_autoptr(GVariantBuilder) metadata_builder =
+    g_variant_builder_new (G_VARIANT_TYPE ("a{sv}"));
+  g_autoptr(GVariant) commit_metadata = NULL;
+  g_autoptr(GVariant) extra_data_sources = NULL;
+  g_autoptr(GPtrArray) extra_data = NULL;
+
+  flatpak_image_source_build_commit_metadata (image_source, metadata_builder);
+  commit_metadata = g_variant_ref_sink (g_variant_builder_end (metadata_builder));
+  extra_data_sources = g_variant_lookup_value (commit_metadata,
+                                               "xa.extra-data-sources",
+                                               G_VARIANT_TYPE ("a(ayttays)"));
+  if (extra_data_sources == NULL)
+    return TRUE;
+
+  {
+    guint64 n_extra_data = 0;
+    guint64 total_download_size = 0;
+
+    compute_extra_data_download_size (extra_data_sources,
+                                      &n_extra_data,
+                                      &total_download_size);
+    flatpak_progress_init_extra_data (progress,
+                                      n_extra_data,
+                                      total_download_size);
+  }
+
+  extra_data = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+
+  if (!flatpak_dir_pull_extra_data (self,
+                                    extra_data_sources,
+                                    progress,
+                                    extra_data,
+                                    NULL,
+                                    cancellable,
+                                    error))
+    return FALSE;
+
+  for (size_t i = 0; i < extra_data->len; i++)
+    {
+      GBytes *bytes = g_ptr_array_index (extra_data, i);
+      g_autofree char *rev = NULL;
+
+      rev = flatpak_oci_registry_store_blob (dst_registry,
+                                             bytes,
+                                             cancellable,
+                                             error);
+      if (rev == NULL)
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+gboolean
+flatpak_dir_pull_oci_extra_data (OstreeRepo              *repo,
+                                 FlatpakImageSource      *image_source,
+                                 const char              *rev,
+                                 GCancellable            *cancellable,
+                                 GError                 **error)
+{
+  g_autoptr(GVariant) extra_data_sources = NULL;
+  g_autoptr(GVariant) detached_metadata = NULL;
+  g_autoptr(GVariantBuilder) extra_data_builder = NULL;
+  g_auto(GVariantDict) new_metadata_dict = FLATPAK_VARIANT_DICT_INITIALIZER;
+  g_autoptr(GVariant) new_detached_metadata = NULL;
+  size_t n_extra_data;
+  FlatpakOciRegistry *registry = flatpak_image_source_get_registry (image_source);
+  const char *repository = flatpak_image_source_get_oci_repository (image_source);
+
+  extra_data_sources = flatpak_repo_get_extra_data_sources (repo, rev,
+                                                            cancellable, NULL);
+  if (extra_data_sources == NULL)
+    return TRUE;
+
+  n_extra_data = g_variant_n_children (extra_data_sources);
+  if (n_extra_data == 0)
+    return TRUE;
+
+  extra_data_builder = g_variant_builder_new (G_VARIANT_TYPE ("a(ayay)"));
+
+  for (size_t i = 0; i < n_extra_data; i++)
+    {
+      const char *name = NULL;
+      const char *uri = NULL;
+      const guchar *expected_sha256_bytes;
+      g_autofree char *expected_sha256 = NULL;
+      g_autofree char *digest = NULL;
+      g_autoptr(GBytes) bytes = NULL;
+
+      flatpak_repo_parse_extra_data_sources (extra_data_sources,
+                                             i,
+                                             &name,
+                                             NULL,
+                                             NULL,
+                                             &expected_sha256_bytes,
+                                             &uri);
+
+      if (expected_sha256_bytes == NULL)
+        {
+          return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA,
+                                     _("Invalid checksum for extra data uri %s"),
+                                     uri);
+        }
+
+      expected_sha256 = ostree_checksum_from_bytes (expected_sha256_bytes);
+      digest = g_strdup_printf ("sha256:%s", expected_sha256);
+
+      bytes = flatpak_oci_registry_load_blob (registry,
+                                              repository,
+                                              FALSE,
+                                              digest,
+                                              NULL,
+                                              NULL,
+                                              cancellable,
+                                              error);
+      if (!bytes)
+        return FALSE;
+
+      g_variant_builder_add (extra_data_builder,
+                             "(^ay@ay)",
+                             name,
+                             g_variant_new_from_bytes (G_VARIANT_TYPE ("ay"),
+                                                       bytes, TRUE));
+    }
+
+  if (!ostree_repo_read_commit_detached_metadata (repo, rev, &detached_metadata,
+                                                  cancellable, error))
+    return FALSE;
+
+  g_variant_dict_init (&new_metadata_dict, detached_metadata);
+  g_variant_dict_insert_value (&new_metadata_dict, "xa.extra-data",
+                               g_variant_builder_end (extra_data_builder));
+  new_detached_metadata = g_variant_ref_sink (g_variant_dict_end (&new_metadata_dict));
+
+  if (!ostree_repo_write_commit_detached_metadata (repo, rev,
+                                                   new_detached_metadata,
+                                                   cancellable, error))
+    return FALSE;
 
   return TRUE;
 }
@@ -5848,57 +6790,42 @@ flatpak_dir_mirror_oci (FlatpakDir          *self,
                         FlatpakRemoteState  *state,
                         const char          *ref,
                         const char          *opt_rev,
-                        const char          *skip_if_current_is,
+                        FlatpakImageSource  *opt_image_source,
                         const char          *token,
                         FlatpakProgress     *progress,
                         GCancellable        *cancellable,
                         GError             **error)
 {
-  g_autoptr(FlatpakOciRegistry) registry = NULL;
-  g_autofree char *oci_digest = NULL;
-  g_autofree char *latest_rev = NULL;
-  VarRefInfoRef latest_rev_info;
-  VarMetadataRef metadata;
-  const char *oci_repository = NULL;
-  const char *delta_url = NULL;
-  const char *rev;
+  g_autoptr(FlatpakImageSource) image_source = NULL;
   gboolean res;
 
-  /* We use the summary so that we can reuse any cached json */
-  if (!flatpak_remote_state_lookup_ref (state, ref, &latest_rev, NULL, &latest_rev_info, NULL, error))
-    return FALSE;
-  if (latest_rev == NULL)
-    return flatpak_fail_error (error, FLATPAK_ERROR_REF_NOT_FOUND,
-                               _("Couldn't find latest checksum for ref %s in remote %s"),
-                               ref, state->remote_name);
+  if (opt_image_source)
+    image_source = g_object_ref (opt_image_source);
 
-  rev = opt_rev != NULL ? opt_rev : latest_rev;
-
-  if (skip_if_current_is != NULL && strcmp (rev, skip_if_current_is) == 0)
+  if (!image_source)
     {
-      return flatpak_fail_error (error, FLATPAK_ERROR_ALREADY_INSTALLED,
-                                 _("%s commit %s already installed"),
-                                 ref, rev);
+      image_source = flatpak_remote_state_fetch_image_source (state, self,
+                                                              ref, opt_rev, token,
+                                                              cancellable, error);
+      if (image_source == NULL)
+        return FALSE;
     }
-
-  metadata = var_ref_info_get_metadata (latest_rev_info);
-  oci_repository = var_metadata_lookup_string (metadata, "xa.oci-repository", NULL);
-  delta_url = var_metadata_lookup_string (metadata, "xa.delta-url", NULL);
-
-  oci_digest = g_strconcat ("sha256:", rev, NULL);
-
-  registry = flatpak_remote_state_new_oci_registry (state, token, cancellable, error);
-  if (registry == NULL)
-    return FALSE;
 
   flatpak_progress_start_oci_pull (progress);
 
-  g_info ("Mirroring OCI image %s", oci_digest);
+  g_info ("Mirroring OCI image %s", flatpak_image_source_get_digest (image_source));
 
-  res = flatpak_mirror_image_from_oci (dst_registry, registry, oci_repository, oci_digest, state->remote_name, ref, delta_url, self->repo, oci_pull_progress_cb,
+  res = flatpak_mirror_image_from_oci (dst_registry, image_source, state->remote_name, ref, self->repo, oci_pull_progress_cb,
                                        progress, cancellable, error);
-
   if (!res)
+    return FALSE;
+
+  if (!flatpak_dir_mirror_oci_extra_data (self,
+                                          dst_registry,
+                                          image_source,
+                                          progress,
+                                          cancellable,
+                                          error))
     return FALSE;
 
   return TRUE;
@@ -5909,6 +6836,7 @@ flatpak_dir_pull_oci (FlatpakDir          *self,
                       FlatpakRemoteState  *state,
                       const char          *ref,
                       const char          *opt_rev,
+                      FlatpakImageSource  *opt_image_source,
                       OstreeRepo          *repo,
                       FlatpakPullFlags     flatpak_flags,
                       OstreeRepoPullFlags  flags,
@@ -5917,57 +6845,32 @@ flatpak_dir_pull_oci (FlatpakDir          *self,
                       GCancellable        *cancellable,
                       GError             **error)
 {
-  g_autoptr(FlatpakOciRegistry) registry = NULL;
-  g_autoptr(FlatpakOciVersioned) versioned = NULL;
-  g_autoptr(FlatpakOciImage) image_config = NULL;
-  const char *oci_repository = NULL;
-  const char *delta_url = NULL;
-  g_autofree char *oci_digest = NULL;
+  g_autoptr(FlatpakImageSource) image_source = NULL;
+  FlatpakOciRegistry *registry = NULL;
+  const char *oci_digest = NULL;
   g_autofree char *checksum = NULL;
-  VarRefInfoRef latest_rev_info;
   g_autofree char *latest_alt_commit = NULL;
-  VarMetadataRef metadata;
-  g_autofree char *latest_rev = NULL;
   G_GNUC_UNUSED g_autofree char *latest_commit =
     flatpak_dir_read_latest (self, state->remote_name, ref, &latest_alt_commit, cancellable, NULL);
   g_autofree char *name = NULL;
 
-  /* We use the summary so that we can reuse any cached json */
-  if (!flatpak_remote_state_lookup_ref (state, ref, &latest_rev, NULL, &latest_rev_info, NULL, error))
-    return FALSE;
-  if (latest_rev == NULL)
-    return flatpak_fail_error (error, FLATPAK_ERROR_REF_NOT_FOUND,
-                               _("Couldn't find latest checksum for ref %s in remote %s"),
-                               ref, state->remote_name);
+  if (opt_image_source)
+    image_source = g_object_ref (opt_image_source);
 
-  metadata = var_ref_info_get_metadata (latest_rev_info);
-  oci_repository = var_metadata_lookup_string (metadata, "xa.oci-repository", NULL);
-  delta_url = var_metadata_lookup_string (metadata, "xa.delta-url", NULL);
+  if (!image_source)
+    {
+      image_source = flatpak_remote_state_fetch_image_source (state, self,
+                                                              ref, opt_rev, token,
+                                                              cancellable, error);
+      if (image_source == NULL)
+        return FALSE;
+    }
 
-  oci_digest = g_strconcat ("sha256:", opt_rev != NULL ? opt_rev : latest_rev, NULL);
+  oci_digest = flatpak_image_source_get_digest (image_source);
 
   /* Short circuit if we've already got this commit */
   if (latest_alt_commit != NULL && strcmp (oci_digest + strlen ("sha256:"), latest_alt_commit) == 0)
     return TRUE;
-
-  registry = flatpak_remote_state_new_oci_registry (state, token, cancellable, error);
-  if (registry == NULL)
-    return FALSE;
-
-  versioned = flatpak_oci_registry_load_versioned (registry, oci_repository, oci_digest,
-                                                   NULL, NULL, cancellable, error);
-  if (versioned == NULL)
-    return FALSE;
-
-  if (!FLATPAK_IS_OCI_MANIFEST (versioned))
-    return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Image is not a manifest"));
-
-  image_config = flatpak_oci_registry_load_image_config (registry, oci_repository,
-                                                         FLATPAK_OCI_MANIFEST (versioned)->config.digest,
-                                                         (const char **)FLATPAK_OCI_MANIFEST (versioned)->config.urls,
-                                                         NULL, cancellable, error);
-  if (image_config == NULL)
-    return FALSE;
 
   if (repo == NULL)
     repo = self->repo;
@@ -5976,13 +6879,30 @@ flatpak_dir_pull_oci (FlatpakDir          *self,
 
   g_info ("Pulling OCI image %s", oci_digest);
 
-  checksum = flatpak_pull_from_oci (repo, registry, oci_repository, oci_digest, delta_url, FLATPAK_OCI_MANIFEST (versioned), image_config,
+  checksum = flatpak_pull_from_oci (repo, image_source, NULL,
                                     state->remote_name, ref, flatpak_flags, oci_pull_progress_cb, progress, cancellable, error);
 
   if (checksum == NULL)
     return FALSE;
 
   g_info ("Imported OCI image as checksum %s", checksum);
+
+  if (!flatpak_dir_setup_extra_data (self, state, repo,
+                                     ref, checksum, token,
+                                     flatpak_flags,
+                                     progress,
+                                     cancellable,
+                                     error))
+    return FALSE;
+
+  if (!flatpak_dir_pull_ostree_extra_data (self, repo,
+                                           state->remote_name,
+                                           ref, checksum,
+                                           flatpak_flags,
+                                           progress,
+                                           cancellable,
+                                           error))
+    return FALSE;
 
   if (repo == self->repo)
     name = flatpak_dir_get_name (self);
@@ -5992,6 +6912,7 @@ flatpak_dir_pull_oci (FlatpakDir          *self,
       name = g_file_get_path (file);
     }
 
+  registry = flatpak_image_source_get_registry (image_source);
   (flatpak_dir_log) (self, __FILE__, __LINE__, __FUNCTION__, name,
                      "pull oci", flatpak_oci_registry_get_uri (registry), ref, NULL, NULL, NULL,
                      "Pulled %s from %s", ref, flatpak_oci_registry_get_uri (registry));
@@ -6006,6 +6927,7 @@ flatpak_dir_pull (FlatpakDir                           *self,
                   const char                           *opt_rev,
                   const char                          **subpaths,
                   GFile                                *sideload_repo,
+                  FlatpakImageSource                   *opt_image_source,
                   GBytes                               *require_metadata,
                   const char                           *token,
                   OstreeRepo                           *repo,
@@ -6036,8 +6958,8 @@ flatpak_dir_pull (FlatpakDir                           *self,
   if (repo == NULL && !flatpak_dir_repo_lock (self, &lock, LOCK_SH, cancellable, error))
     return FALSE;
 
-  if (flatpak_dir_get_remote_oci (self, state->remote_name))
-    return flatpak_dir_pull_oci (self, state, ref, opt_rev, repo, flatpak_flags,
+  if (opt_image_source || flatpak_dir_get_remote_oci (self, state->remote_name))
+    return flatpak_dir_pull_oci (self, state, ref, opt_rev, opt_image_source, repo, flatpak_flags,
                                  flags, token, progress, cancellable, error);
 
   if (!ostree_repo_remote_get_url (self->repo,
@@ -6056,7 +6978,7 @@ flatpak_dir_pull (FlatpakDir                           *self,
     {
       rev = g_strdup (opt_rev);
     }
-  else if (!flatpak_remote_state_lookup_ref (state, ref, &rev, NULL, NULL, NULL, error))
+  else if (!flatpak_remote_state_lookup_ref (state, ref, &rev, NULL, NULL, NULL, NULL, error))
     {
       g_assert (error == NULL || *error != NULL);
       return FALSE;
@@ -6088,7 +7010,7 @@ flatpak_dir_pull (FlatpakDir                           *self,
   /* Setup extra data information before starting to pull, so we can have precise
    * progress reports */
   if (!flatpak_dir_setup_extra_data (self, state, repo,
-                                     ref, rev, sideload_repo, token,
+                                     ref, rev, token,
                                      flatpak_flags,
                                      progress,
                                      cancellable,
@@ -6121,7 +7043,7 @@ flatpak_dir_pull (FlatpakDir                           *self,
   if (!repo_pull (repo, state,
                   subdirs_arg ? (const char **) subdirs_arg->pdata : NULL,
                   ref, rev, sideload_repo, token, flatpak_flags, flags,
-                  progress,
+                  progress, self,
                   cancellable, error))
     {
       g_prefix_error (error, _("While pulling %s from remote %s: "), ref, state->remote_name);
@@ -6141,13 +7063,13 @@ flatpak_dir_pull (FlatpakDir                           *self,
         goto out;
     }
 
-  if (!flatpak_dir_pull_extra_data (self, repo,
-                                    state->remote_name,
-                                    ref, rev,
-                                    flatpak_flags,
-                                    progress,
-                                    cancellable,
-                                    error))
+  if (!flatpak_dir_pull_ostree_extra_data (self, repo,
+                                           state->remote_name,
+                                           ref, rev,
+                                           flatpak_flags,
+                                           progress,
+                                           cancellable,
+                                           error))
     goto out;
 
 
@@ -7064,22 +7986,23 @@ static void
 maybe_reload_dbus_config (GCancellable *cancellable)
 {
   g_autoptr(GDBusConnection) session_bus = NULL;
+  g_autoptr(GVariant) ret = NULL;
 
   session_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, cancellable, NULL);
   if (!session_bus)
     return;
 
-  g_dbus_connection_call_sync (session_bus,
-                               "org.freedesktop.DBus",
-                               "/org/freedesktop/DBus",
-                               "org.freedesktop.DBus",
-                               "ReloadConfig",
-                               NULL,
-                               NULL,
-                               G_DBUS_CALL_FLAGS_NONE,
-                               2000,
-                               cancellable,
-                               NULL);
+  ret = g_dbus_connection_call_sync (session_bus,
+                                     "org.freedesktop.DBus",
+                                     "/org/freedesktop/DBus",
+                                     "org.freedesktop.DBus",
+                                     "ReloadConfig",
+                                     NULL,
+                                     NULL,
+                                     G_DBUS_CALL_FLAGS_NONE,
+                                     2000,
+                                     cancellable,
+                                     NULL);
 }
 
 gboolean
@@ -7092,7 +8015,7 @@ flatpak_dir_run_triggers (FlatpakDir   *self,
   g_autoptr(GFileInfo) child_info = NULL;
   g_autoptr(GFile) triggersdir = NULL;
   GError *temp_error = NULL;
-  const char *triggerspath;
+  g_autofree char *triggerspath = NULL;
 
   maybe_reload_dbus_config (cancellable);
 
@@ -7110,9 +8033,9 @@ flatpak_dir_run_triggers (FlatpakDir   *self,
       return TRUE;
     }
 
-  triggerspath = g_getenv ("FLATPAK_TRIGGERSDIR");
+  triggerspath = g_strdup (g_getenv ("FLATPAK_TRIGGERSDIR"));
   if (triggerspath == NULL)
-    triggerspath = FLATPAK_TRIGGERDIR;
+    triggerspath = g_build_filename (get_data_dir_location (), FLATPAK_TRIGGERS_DIR, NULL);
 
   g_info ("running triggers from %s", triggerspath);
 
@@ -7492,9 +8415,6 @@ export_desktop_file (const char         *app,
   g_autofree gchar *new_data = NULL;
   gsize new_data_len;
   g_autoptr(GKeyFile) keyfile = NULL;
-  g_autofree gchar *old_exec = NULL;
-  gint old_argc;
-  g_auto(GStrv) old_argv = NULL;
   g_auto(GStrv) groups = NULL;
   g_autofree char *escaped_app = maybe_quote (app);
   g_autofree char *escaped_branch = maybe_quote (branch);
@@ -7544,6 +8464,15 @@ export_desktop_file (const char         *app,
 
       /* Add a marker so consumers can easily find out that this launches a sandbox */
       g_key_file_set_string (keyfile, G_KEY_FILE_DESKTOP_GROUP, "X-Flatpak", app);
+
+      /* Disable krunner dbusplugins by default, so that flatpak applications cannot
+       * unintentionally grab sensitive search data.
+       */
+      if (g_key_file_get_boolean (keyfile, G_KEY_FILE_DESKTOP_GROUP,
+                               "X-KDE-PluginInfo-EnabledByDefault", NULL))
+        {
+          g_key_file_set_boolean (keyfile, G_KEY_FILE_DESKTOP_GROUP, "X-KDE-PluginInfo-EnabledByDefault", FALSE);
+        }
 
       /* If the app has been renamed, add its old .desktop filename to
        * X-Flatpak-RenamedFrom in the new .desktop file, taking care not to
@@ -7610,6 +8539,9 @@ export_desktop_file (const char         *app,
 
   for (i = 0; groups[i] != NULL; i++)
     {
+      gint old_argc;
+      g_auto(GStrv) old_argv = NULL;
+      g_autofree gchar *old_exec = NULL;
       g_autoptr(GString) new_exec = NULL;
       g_auto(GStrv) flatpak_run_opts = g_key_file_get_string_list (keyfile, groups[i], "X-Flatpak-RunOptions", NULL, NULL);
       g_autofree char *flatpak_run_args = format_flatpak_run_args_from_run_opts (flatpak_run_opts);
@@ -8015,8 +8947,10 @@ flatpak_export_dir (GFile        *source,
     "share/icons",                         "../..",
     "share/dbus-1/services",               "../../..",
     "share/gnome-shell/search-providers",  "../../..",
+    "share/krunner/dbusplugins",           "../../..",
     "share/mime/packages",                 "../../..",
     "share/metainfo",                      "../..",
+    "share/metainfo/releases",             "../../..",
     "bin",                                 "..",
   };
   int i;
@@ -8188,7 +9122,7 @@ extract_extra_data (FlatpakDir   *self,
           const guchar *data;
           gsize len;
 
-          g_variant_get_child (extra_data, j, "(^ay@ay)",
+          g_variant_get_child (extra_data, j, "(^&ay@ay)",
                                &extra_data_name,
                                &content);
 
@@ -8311,12 +9245,16 @@ apply_extra_data (FlatpakDir   *self,
     }
 
   runtime_pref = g_key_file_get_string (metakey, group,
-                                        FLATPAK_METADATA_KEY_RUNTIME, error);
+                                        FLATPAK_METADATA_KEY_RUNTIME, NULL);
   if (runtime_pref == NULL)
     runtime_pref = g_key_file_get_string (metakey, FLATPAK_METADATA_GROUP_EXTENSION_OF,
                                           FLATPAK_METADATA_KEY_RUNTIME, NULL);
   if (runtime_pref == NULL)
-    return FALSE;
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   _("Unable to get runtime key from metadata"));
+      return FALSE;
+    }
 
   runtime_ref = flatpak_decomposed_new_from_pref (FLATPAK_KINDS_RUNTIME, runtime_pref, error);
   if (runtime_ref == NULL)
@@ -8328,6 +9266,9 @@ apply_extra_data (FlatpakDir   *self,
     {
       /* We pass in self here so that we ensure that we find the runtime in case it only
          exists in this installation (which might be custom) */
+      /* TODO: This is a circular dependency between flatpak-dir (which
+       * deals with a single installation) and flatpak-dir-utils (which
+       * deals with all the installations on the system). */
       runtime_deploy = flatpak_find_deploy_for_ref (flatpak_decomposed_get_ref (runtime_ref), NULL, self, cancellable, error);
       if (runtime_deploy == NULL)
         return FALSE;
@@ -8380,7 +9321,8 @@ apply_extra_data (FlatpakDir   *self,
   app_context = flatpak_context_new ();
 
   if (!flatpak_run_add_environment_args (bwrap, NULL, run_flags, id,
-                                         app_context, NULL, NULL, -1,
+                                         app_context, 0, 0, 0, 0,
+                                         NULL, NULL, -1,
                                          NULL, NULL, cancellable, error))
     return FALSE;
 
@@ -8452,6 +9394,7 @@ static gboolean
 flatpak_dir_check_parental_controls (FlatpakDir    *self,
                                      const char    *ref,
                                      GBytes        *deploy_data,
+                                     const char    *action_id,
                                      GCancellable  *cancellable,
                                      GError       **error)
 {
@@ -8476,9 +9419,8 @@ flatpak_dir_check_parental_controls (FlatpakDir    *self,
   /* Assume that root is allowed to install any ref and shouldn't have any
    * parental controls restrictions applied to them. Note that this branch
    * must not be taken if this code is running within the system-helper, as that
-   * runs as root but on behalf of another process. If running within the
-   * system-helper, self->source_pid is non-zero. */
-  if (self->source_pid == 0 && getuid () == 0)
+   * runs as root but on behalf of another process. */
+  if (!self->subject && getuid () == 0)
     {
       g_info ("Skipping parental controls check for %s due to running as root", ref);
       return TRUE;
@@ -8510,19 +9452,33 @@ flatpak_dir_check_parental_controls (FlatpakDir    *self,
       return FALSE;
     }
 
-  if (self->user || self->source_pid == 0)
-    subject = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
-  else
-    subject = polkit_unix_process_new_for_owner (self->source_pid, 0, -1);
+  if (self->subject)
+    {
+      g_autoptr(AutoPolkitSubject) process_subject = NULL;
 
-  /* Get the parental controls for the invoking user. */
-  subject_uid = polkit_unix_process_get_uid (POLKIT_UNIX_PROCESS (subject));
+      subject = g_object_ref (self->subject);
+      /* This internally uses dbus GetConnectionCredentials which ensures we
+       * get the right UID. We should *not* use it for authorization via the
+       * PID though! */
+      process_subject =
+        polkit_system_bus_name_get_process_sync (POLKIT_SYSTEM_BUS_NAME (subject),
+                                                 cancellable, NULL);
+      subject_uid = polkit_unix_process_get_uid (POLKIT_UNIX_PROCESS (process_subject));
+    }
+  else
+    {
+      subject_uid = getuid ();
+      subject = polkit_unix_process_new_for_owner (getpid (), 0, subject_uid);
+    }
+
   if (subject_uid == -1)
     {
       g_set_error_literal (error, G_DBUS_ERROR, G_DBUS_ERROR_AUTH_FAILED,
                            "Failed to get subject UID");
       return FALSE;
     }
+
+  g_assert (subject != NULL);
 
   manager = mct_manager_new (dbus_connection);
   manager_flags = MCT_MANAGER_GET_VALUE_FLAGS_NONE;
@@ -8578,7 +9534,7 @@ flatpak_dir_check_parental_controls (FlatpakDir    *self,
   if (!flatpak_dir_get_no_interaction (self))
     polkit_flags |= POLKIT_CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION;
   result = polkit_authority_check_authorization_sync (authority, subject,
-                                                      "org.freedesktop.Flatpak.override-parental-controls",
+                                                      action_id,
                                                       NULL,
                                                       polkit_flags,
                                                       cancellable, error);
@@ -8623,6 +9579,7 @@ flatpak_dir_deploy (FlatpakDir          *self,
                     const char          *checksum_or_latest,
                     const char * const * subpaths,
                     const char * const * previous_ids,
+                    const char          *parental_controls_action_id,
                     GCancellable        *cancellable,
                     GError             **error)
 {
@@ -8915,7 +9872,7 @@ flatpak_dir_deploy (FlatpakDir          *self,
       files_etc = g_file_resolve_relative_path (checkoutdir, "files/etc");
       if (g_file_query_exists (files_etc, cancellable))
         {
-          char *etcfiles[] = {"passwd", "group", "machine-id" };
+          static const char * const etcfiles[] = {"passwd", "group", "machine-id" };
           g_autoptr(GFile) etc_resolve_conf = g_file_get_child (files_etc, "resolv.conf");
           int i;
           for (i = 0; i < G_N_ELEMENTS (etcfiles); i++)
@@ -9004,7 +9961,9 @@ flatpak_dir_deploy (FlatpakDir          *self,
 
   /* Check the app is actually allowed to be used by this user. This can block
    * on getting authorisation. */
-  if (!flatpak_dir_check_parental_controls (self, flatpak_decomposed_get_ref (ref), deploy_data, cancellable, error))
+  if (!flatpak_dir_check_parental_controls (self, flatpak_decomposed_get_ref (ref),
+                                            deploy_data, parental_controls_action_id,
+                                            cancellable, error))
     return FALSE;
 
   deploy_data_file = g_file_get_child (checkoutdir, "deploy");
@@ -9073,6 +10032,7 @@ flatpak_dir_deploy_install (FlatpakDir        *self,
                             const char       **previous_ids,
                             gboolean           reinstall,
                             gboolean           pin_on_deploy,
+                            gboolean           update_preinstalled_on_deploy,
                             GCancellable      *cancellable,
                             GError           **error)
 {
@@ -9139,7 +10099,9 @@ flatpak_dir_deploy_install (FlatpakDir        *self,
   created_deploy_base = TRUE;
 
   if (!flatpak_dir_deploy (self, origin, ref, NULL, (const char * const *) subpaths,
-                           previous_ids, cancellable, error))
+                           previous_ids,
+                           "org.freedesktop.Flatpak.override-parental-controls",
+                           cancellable, error))
     goto out;
 
   if (flatpak_decomposed_is_app (ref))
@@ -9176,6 +10138,14 @@ flatpak_dir_deploy_install (FlatpakDir        *self,
       !flatpak_dir_config_append_pattern (self, "pinned",
                                           flatpak_decomposed_get_ref (ref),
                                           TRUE, NULL, error))
+    goto out;
+
+  /* Save preinstalled refs to keep the data on what is user installed and what
+   * is automatically installed. */
+  if (update_preinstalled_on_deploy &&
+      !flatpak_dir_config_append_pattern (self, "preinstalled",
+                                          flatpak_decomposed_get_ref (ref),
+                                          FALSE, NULL, error))
     goto out;
 
   ret = TRUE;
@@ -9240,6 +10210,7 @@ flatpak_dir_deploy_update (FlatpakDir        *self,
                            checksum_or_latest,
                            opt_subpaths ? opt_subpaths : old_subpaths,
                            (const char * const *) previous_ids_owned,
+                           "org.freedesktop.Flatpak.override-parental-controls-update",
                            cancellable, error))
     return FALSE;
 
@@ -9778,12 +10749,14 @@ flatpak_dir_install (FlatpakDir          *self,
                      gboolean             reinstall,
                      gboolean             app_hint,
                      gboolean             pin_on_deploy,
+                     gboolean             update_preinstalled_on_deploy,
                      FlatpakRemoteState  *state,
                      FlatpakDecomposed   *ref,
                      const char          *opt_commit,
                      const char         **opt_subpaths,
                      const char         **opt_previous_ids,
                      GFile               *sideload_repo,
+                     FlatpakImageSource  *opt_image_source,
                      GBytes              *require_metadata,
                      const char          *token,
                      FlatpakProgress     *progress,
@@ -9848,7 +10821,8 @@ flatpak_dir_install (FlatpakDir          *self,
 
           child_repo_path = g_file_get_path (registry_file);
 
-          if (!flatpak_dir_mirror_oci (self, registry, state, flatpak_decomposed_get_ref (ref), opt_commit, NULL, token, progress, cancellable, error))
+          if (!flatpak_dir_mirror_oci (self, registry, state, flatpak_decomposed_get_ref (ref),
+                                       opt_commit, opt_image_source, token, progress, cancellable, error))
             return FALSE;
         }
       else if (!gpg_verify_summary || !gpg_verify)
@@ -9942,7 +10916,7 @@ flatpak_dir_install (FlatpakDir          *self,
 
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
 
-          if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref), opt_commit, subpaths, sideload_repo, require_metadata, token,
+          if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref), opt_commit, subpaths, sideload_repo, NULL, require_metadata, token,
                                  child_repo,
                                  flatpak_flags,
                                  0,
@@ -9990,6 +10964,9 @@ flatpak_dir_install (FlatpakDir          *self,
       if (pin_on_deploy)
         helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_UPDATE_PINNED;
 
+      if (update_preinstalled_on_deploy)
+        helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_UPDATE_PREINSTALLED;
+
       helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_INSTALL_HINT;
 
       if (!flatpak_dir_system_helper_call_deploy (self,
@@ -10017,7 +10994,8 @@ flatpak_dir_install (FlatpakDir          *self,
 
   if (!no_pull)
     {
-      if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref), opt_commit, opt_subpaths, sideload_repo, require_metadata, token, NULL,
+      if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref), opt_commit, opt_subpaths,
+                             sideload_repo, opt_image_source, require_metadata, token, NULL,
                              flatpak_flags, OSTREE_REPO_PULL_FLAGS_NONE,
                              progress, cancellable, error))
         return FALSE;
@@ -10027,6 +11005,7 @@ flatpak_dir_install (FlatpakDir          *self,
     {
       if (!flatpak_dir_deploy_install (self, ref, state->remote_name, opt_subpaths,
                                        opt_previous_ids, reinstall, pin_on_deploy,
+                                       update_preinstalled_on_deploy,
                                        cancellable, error))
         return FALSE;
 
@@ -10193,6 +11172,7 @@ flatpak_dir_check_add_remotes_config_dir (FlatpakDir *self,
 
 gboolean
 flatpak_dir_install_bundle (FlatpakDir         *self,
+                            gboolean            reinstall,
                             GFile              *file,
                             const char         *remote,
                             FlatpakDecomposed **out_ref,
@@ -10206,6 +11186,7 @@ flatpak_dir_install_bundle (FlatpakDir         *self,
   g_autofree char *origin = NULL;
   g_autofree char *to_checksum = NULL;
   gboolean gpg_verify;
+  FlatpakHelperInstallBundleFlags install_flags = FLATPAK_HELPER_INSTALL_BUNDLE_FLAGS_NONE;
 
   if (!flatpak_dir_check_add_remotes_config_dir (self, error))
     return FALSE;
@@ -10214,9 +11195,13 @@ flatpak_dir_install_bundle (FlatpakDir         *self,
     {
       const char *installation = flatpak_dir_get_id (self);
 
+      if (reinstall)
+        install_flags |= FLATPAK_HELPER_INSTALL_BUNDLE_FLAGS_REINSTALL;
+
       if (!flatpak_dir_system_helper_call_install_bundle (self,
                                                           flatpak_file_get_path_cached (file),
-                                                          0, remote,
+                                                          install_flags,
+                                                          remote,
                                                           installation ? installation : "",
                                                           &ref_str,
                                                           cancellable,
@@ -10251,17 +11236,30 @@ flatpak_dir_install_bundle (FlatpakDir         *self,
     {
       if (strcmp (flatpak_deploy_data_get_commit (deploy_data), to_checksum) == 0)
         {
-          g_autofree char *id = flatpak_decomposed_dup_id (ref);
-          g_set_error (error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED,
-                       _("This version of %s is already installed"), id);
-          return FALSE;
+          if (reinstall)
+            {
+              g_clear_pointer (&deploy_data, g_bytes_unref);
+            }
+          else
+            {
+              g_autofree char *id = flatpak_decomposed_dup_id (ref);
+              g_set_error (error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED,
+                           _("This version of %s is already installed"), id);
+              return FALSE;
+            }
         }
-
-      if (strcmp (remote, flatpak_deploy_data_get_origin (deploy_data)) != 0)
+      else if (strcmp (remote, flatpak_deploy_data_get_origin (deploy_data)) != 0)
         {
-          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                       _("Can't change remote during bundle install"));
-          return FALSE;
+          if (reinstall)
+            {
+              g_clear_pointer (&deploy_data, g_bytes_unref);
+            }
+          else
+            {
+              g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           _("Can't change remote during bundle install"));
+              return FALSE;
+            }
         }
     }
 
@@ -10317,7 +11315,7 @@ flatpak_dir_install_bundle (FlatpakDir         *self,
     }
   else
     {
-      if (!flatpak_dir_deploy_install (self, ref, remote, NULL, NULL, FALSE, FALSE, cancellable, error))
+      if (!flatpak_dir_deploy_install (self, ref, remote, NULL, NULL, reinstall, FALSE, FALSE, cancellable, error))
         return FALSE;
     }
 
@@ -10433,7 +11431,7 @@ flatpak_dir_check_for_update (FlatpakDir               *self,
   else
     {
       if (!flatpak_dir_find_latest_rev (self, state, flatpak_decomposed_get_ref (ref), checksum_or_latest, &latest_rev,
-                                        NULL, NULL, cancellable, error))
+                                        NULL, NULL, NULL, cancellable, error))
         return NULL;
     }
 
@@ -10464,6 +11462,7 @@ flatpak_dir_update (FlatpakDir                           *self,
                     const char                          **opt_subpaths,
                     const char                          **opt_previous_ids,
                     GFile                                *sideload_repo,
+                    FlatpakImageSource                   *opt_image_source,
                     GBytes                               *require_metadata,
                     const char                           *token,
                     FlatpakProgress                      *progress,
@@ -10551,7 +11550,7 @@ flatpak_dir_update (FlatpakDir                           *self,
           child_repo_path = g_file_get_path (registry_file);
 
           if (!flatpak_dir_mirror_oci (self, registry, state, flatpak_decomposed_get_ref (ref),
-                                       commit, NULL, token, progress, cancellable, error))
+                                       commit, opt_image_source, token, progress, cancellable, error))
             return FALSE;
         }
       else if (!gpg_verify_summary || !gpg_verify)
@@ -10631,7 +11630,7 @@ flatpak_dir_update (FlatpakDir                           *self,
 
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
           if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref),
-                                 commit, subpaths, sideload_repo, require_metadata, token,
+                                 commit, subpaths, sideload_repo, NULL, require_metadata, token,
                                  child_repo,
                                  flatpak_flags, 0,
                                  progress, cancellable, error))
@@ -10697,7 +11696,7 @@ flatpak_dir_update (FlatpakDir                           *self,
   if (!no_pull)
     {
       if (!flatpak_dir_pull (self, state, flatpak_decomposed_get_ref (ref),
-                             commit, subpaths, sideload_repo, require_metadata, token,
+                             commit, subpaths, sideload_repo, opt_image_source, require_metadata, token,
                              NULL, flatpak_flags, OSTREE_REPO_PULL_FLAGS_NONE,
                              progress, cancellable, error))
         return FALSE;
@@ -10747,6 +11746,7 @@ flatpak_dir_uninstall (FlatpakDir                 *self,
   g_autoptr(GBytes) deploy_data = NULL;
   gboolean keep_ref = flags & FLATPAK_HELPER_UNINSTALL_FLAGS_KEEP_REF;
   gboolean force_remove = flags & FLATPAK_HELPER_UNINSTALL_FLAGS_FORCE_REMOVE;
+  gboolean update_preinstalled = flags & FLATPAK_HELPER_UNINSTALL_FLAGS_UPDATE_PREINSTALLED;
 
   name = flatpak_decomposed_dup_id (ref);
 
@@ -10851,6 +11851,10 @@ flatpak_dir_uninstall (FlatpakDir                 *self,
   flatpak_dir_cleanup_removed (self, cancellable, NULL);
 
   if (!flatpak_dir_mark_changed (self, error))
+    return FALSE;
+
+  if (update_preinstalled &&
+      !flatpak_dir_config_remove_pattern (self, "preinstalled", flatpak_decomposed_get_ref (ref), error))
     return FALSE;
 
   if (!was_deployed)
@@ -12714,6 +13718,7 @@ _flatpak_dir_get_remote_state (FlatpakDir   *self,
       if (!ostree_repo_remote_get_url (self->repo, remote_or_uri, &url, error))
         return NULL;
 
+      state->is_oci = flatpak_dir_get_remote_oci (self, remote_or_uri);
       state->default_token_type = flatpak_dir_get_remote_default_token_type (self, remote_or_uri);
     }
 
@@ -12900,9 +13905,13 @@ _flatpak_dir_get_remote_state (FlatpakDir   *self,
         return NULL;
     }
 
+  /* For OCI remotes, the collection ID is local configuration only:
+   * In the future we could add it to the index format.
+   */
   if (state->collection_id != NULL &&
       state->summary != NULL &&
-      !_validate_summary_for_collection_id (state->summary, state->collection_id, error))
+      !(flatpak_dir_get_remote_oci (self, state->remote_name) ||
+        _validate_summary_for_collection_id (state->summary, state->collection_id, error)))
     return NULL;
 
   if (flatpak_dir_get_remote_oci (self, remote_or_uri))
@@ -13047,6 +14056,56 @@ populate_hash_table_from_refs_map (GHashTable         *ret_all_refs,
 }
 
 
+static void
+populate_hash_table_from_image_collection (GHashTable             *ret_all_refs,
+                                           GHashTable             *ref_timestamps,
+                                           FlatpakImageCollection *image_collection,
+                                           const char             *opt_collection_id,
+                                           FlatpakRemoteState     *state)
+{
+  g_autoptr(GPtrArray) sources = flatpak_image_collection_get_sources (image_collection);
+
+  for (guint i = 0; i < sources->len; i++)
+    {
+      FlatpakImageSource *image_source = g_ptr_array_index (sources, i);
+      const char *ref_name = flatpak_image_source_get_ref (image_source);
+      const char *digest = flatpak_image_source_get_digest (image_source);
+      const char *checksum;
+      guint64 *new_timestamp = NULL;
+      g_autoptr(FlatpakDecomposed) decomposed = NULL;
+
+      if (!flatpak_remote_state_allow_ref (state, ref_name))
+        continue;
+
+      g_assert (g_str_has_prefix (digest, "sha256:"));
+      checksum = digest + 7;
+
+      decomposed = flatpak_decomposed_new_from_col_ref (ref_name, opt_collection_id, NULL);
+      if (decomposed == NULL)
+        continue;
+
+      if (ref_timestamps)
+        {
+          guint64 timestamp = flatpak_image_source_get_commit_timestamp (image_source);
+          gpointer value;
+
+          if (g_hash_table_lookup_extended (ref_timestamps, ref_name, NULL, &value))
+            {
+              guint64 *old_timestamp = value;
+              if (*old_timestamp >= timestamp)
+                continue; /* New timestamp is older, skip this commit */
+            }
+
+          new_timestamp = g_memdup2 (&timestamp, sizeof (guint64));
+        }
+
+      g_hash_table_replace (ret_all_refs, g_steal_pointer (&decomposed), g_strdup (checksum));
+      if (new_timestamp)
+        g_hash_table_replace (ref_timestamps, g_strdup (ref_name), new_timestamp);
+    }
+}
+
+
 /* This tries to list all available remote refs but also tries to keep
  * working when offline, so it looks in sideloaded repos. Also it uses
  * in-memory cached summaries which ostree doesn't. */
@@ -13118,25 +14177,37 @@ flatpak_dir_list_all_remote_refs (FlatpakDir         *self,
       ref_map = var_summary_get_ref_map (summary);
       populate_hash_table_from_refs_map (ret_all_refs, NULL, ref_map, main_collection_id, state);
     }
-  else if (state->collection_id)
+  else
     {
       g_autoptr(GHashTable) ref_mtimes = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
       /* No main summary, add just all sideloded refs, with the latest version of each checksum */
 
-      for (int i = 0; i < state->sideload_repos->len; i++)
+      if (state->collection_id)
         {
-          FlatpakSideloadState *ss = g_ptr_array_index (state->sideload_repos, i);
-
-          summary = var_summary_from_gvariant (ss->summary);
-          exts = var_summary_get_metadata (summary);
-
-          if (var_metadata_lookup (exts, "ostree.summary.collection-map", NULL, &v))
+          for (int i = 0; i < state->sideload_repos->len; i++)
             {
-              VarCollectionMapRef map = var_collection_map_from_variant (v);
+              FlatpakSideloadState *ss = g_ptr_array_index (state->sideload_repos, i);
 
-              if (var_collection_map_lookup (map, state->collection_id, NULL, &ref_map))
-                populate_hash_table_from_refs_map (ret_all_refs, ref_mtimes, ref_map, NULL, state);
+              summary = var_summary_from_gvariant (ss->summary);
+              exts = var_summary_get_metadata (summary);
+
+              if (var_metadata_lookup (exts, "ostree.summary.collection-map", NULL, &v))
+                {
+                  VarCollectionMapRef map = var_collection_map_from_variant (v);
+
+                  if (var_collection_map_lookup (map, state->collection_id, NULL, &ref_map))
+                    populate_hash_table_from_refs_map (ret_all_refs, ref_mtimes, ref_map, NULL, state);
+                }
+            }
+        }
+
+      if (state->is_oci)
+        {
+          for (int i = 0; i < state->sideload_image_collections->len; i++)
+            {
+              FlatpakImageCollection *collection = g_ptr_array_index (state->sideload_image_collections, i);
+              populate_hash_table_from_image_collection (ret_all_refs, ref_mtimes, collection, NULL, state);
             }
         }
     }
@@ -14239,6 +15310,21 @@ flatpak_dir_get_remote_disabled (FlatpakDir *self,
 }
 
 static char *
+flatpak_dir_get_remote_signature_lookaside (FlatpakDir *self,
+                                            const char *remote_name)
+{
+  GKeyFile *config = flatpak_dir_get_repo_config (self);
+  g_autofree char *group = get_group (remote_name);
+  g_autofree char *signature_lookaside = NULL;
+
+  signature_lookaside = g_key_file_get_string (config, group, "xa.signature-lookaside", NULL);
+  if (signature_lookaside == NULL || *signature_lookaside == '\0')
+    return NULL;
+
+  return g_steal_pointer (&signature_lookaside);
+}
+
+static char *
 flatpak_dir_get_remote_install_authenticator_name (FlatpakDir *self,
                                                    const char *remote_name)
 {
@@ -14462,6 +15548,7 @@ parse_ref_file (GKeyFile *keyfile,
   *url_out = NULL;
   *gpg_data_out = NULL;
   *is_runtime_out = FALSE;
+  *collection_id_out = NULL;
 
   if (!g_key_file_has_group (keyfile, FLATPAK_REF_GROUP))
     return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("Invalid file format, no %s group"), FLATPAK_REF_GROUP);
@@ -14673,8 +15760,7 @@ flatpak_dir_list_remotes (FlatpakDir   *self,
   if (res == NULL)
     res = g_new0 (char *, 1); /* Return empty array, not error */
 
-  g_qsort_with_data (res, g_strv_length (res), sizeof (char *),
-                     cmp_remote, self);
+  qsort_r (res, g_strv_length (res), sizeof (char *), cmp_remote, self);
 
   return res;
 }
@@ -15468,6 +16554,9 @@ add_related (FlatpakDir        *self,
     auto_prune = TRUE;
 
   /* Don't download if there is an unmaintained extension already installed */
+  /* TODO: This is a circular dependency between flatpak-dir (which
+   * deals with a single installation) and flatpak-dir-utils (which
+   * deals with all the installations on the system). */
   unmaintained_path =
     flatpak_find_unmaintained_extension_dir_if_exists (id, arch, branch, NULL);
   if (unmaintained_path != NULL && deploy_data == NULL)
@@ -15713,7 +16802,7 @@ flatpak_dir_find_remote_related_for_metadata (FlatpakDir         *self,
               if (extension_ref == NULL)
                 continue;
 
-              if (flatpak_remote_state_lookup_ref (state, flatpak_decomposed_get_ref (extension_ref), &checksum, NULL, NULL, NULL, NULL))
+              if (flatpak_remote_state_lookup_ref (state, flatpak_decomposed_get_ref (extension_ref), &checksum, NULL, NULL, NULL, NULL, NULL))
                 {
                   if (flatpak_filters_allow_ref (NULL, masked, flatpak_decomposed_get_ref (extension_ref)))
                     add_related (self, related, state->remote_name, extension, extension_ref, checksum,
@@ -15728,7 +16817,7 @@ flatpak_dir_find_remote_related_for_metadata (FlatpakDir         *self,
                       g_autofree char *subref_checksum = NULL;
 
                       if (flatpak_remote_state_lookup_ref (state, flatpak_decomposed_get_ref (subref_ref),
-                                                           &subref_checksum, NULL, NULL, NULL, NULL) &&
+                                                           &subref_checksum, NULL, NULL, NULL, NULL, NULL) &&
                           flatpak_filters_allow_ref (NULL, masked,  flatpak_decomposed_get_ref (subref_ref)))
                         add_related (self, related, state->remote_name, extension, subref_ref, subref_checksum,
                                      no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
@@ -16267,16 +17356,10 @@ flatpak_dir_get_locale_subpaths (FlatpakDir *self)
 }
 
 void
-flatpak_dir_set_source_pid (FlatpakDir *self,
-                            pid_t       pid)
+flatpak_dir_set_subject (FlatpakDir    *self,
+                         PolkitSubject *subject)
 {
-  self->source_pid = pid;
-}
-
-pid_t
-flatpak_dir_get_source_pid (FlatpakDir *self)
-{
-  return self->source_pid;
+  g_set_object (&self->subject, subject);
 }
 
 static void
@@ -16295,11 +17378,14 @@ static void
                      ...)
 {
 #ifdef HAVE_LIBSYSTEMD
-  const char *installation = source ? source : flatpak_dir_get_name_cached (self);
-  pid_t source_pid = flatpak_dir_get_source_pid (self);
+  const char *installation;
+  g_autofree char *subject = NULL;
   char message[1024];
   int len;
   va_list args;
+
+  installation = source ? source : flatpak_dir_get_name_cached (self);
+  subject = self->subject ? polkit_subject_to_string (self->subject) : g_strdup ("(none)");
 
   len = g_snprintf (message, sizeof (message), "%s: ", installation);
 
@@ -16312,7 +17398,7 @@ static void
    */
   sd_journal_send ("MESSAGE_ID=" FLATPAK_MESSAGE_ID,
                    "PRIORITY=5",
-                   "OBJECT_PID=%d", source_pid,
+                   "SUBJECT=%s", subject,
                    "CODE_FILE=%s", file,
                    "CODE_LINE=%d", line,
                    "CODE_FUNC=%s", func,

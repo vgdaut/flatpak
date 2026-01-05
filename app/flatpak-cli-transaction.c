@@ -1,5 +1,6 @@
 /* vi:set et sw=2 sts=2 cin cino=t0,f0,(0,{s,>2s,n-s,^-s,e-s:
  * Copyright © 2018 Red Hat, Inc
+ * Copyright © 2024 GNOME Foundation, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,6 +17,7 @@
  *
  * Authors:
  *       Alexander Larsson <alexl@redhat.com>
+ *       Hubert Figuière <hub@figuiere.net>
  */
 
 #include "config.h"
@@ -315,7 +317,8 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
           guint64 total_time = elapsed_time * 100 / (double) percent;
           remaining = format_duration (total_time - elapsed_time);
         }
-      speed = g_strdup_printf ("%s/s%s%s", formatted_bytes_sec, remaining ? "  " : "", remaining ? remaining : "");
+      /* Formatted size/remaining time in seconds */
+      speed = g_strdup_printf (_("%s/s%s%s"), formatted_bytes_sec, remaining ? "  " : "", remaining ? remaining : "");
       cli->speed_len = MAX (cli->speed_len, strlen (speed) + 2);
     }
 
@@ -351,7 +354,9 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
     g_string_append (str, " ");
 
   g_string_append (str, " ");
-  g_string_append_printf (str, "%3d%%", percent);
+  /* Download progress percentage, use the appropriate
+    percent format for your language */
+  g_string_append_printf (str, _("%3d%%"), percent);
 
   if (speed)
     g_string_append_printf (str, "  %s", speed);
@@ -376,6 +381,7 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
         }
       if (!redraw (cli))
         g_print ("\r%s", str->str); /* redraw failed, just update the progress */
+      flatpak_pty_set_progress (percent);
     }
   else
     g_print ("%s\n", str->str);
@@ -591,6 +597,18 @@ operation_error (FlatpakTransaction            *transaction,
         }
     }
 
+  /* On a fatal error, just clear the progress line. The error will be printed in main() before exiting. */
+  if (!non_fatal && self->stop_on_first_error)
+    {
+      if (flatpak_fancy_output ())
+        {
+          flatpak_table_printer_set_cell (self->printer, self->progress_row, 0, "");
+          redraw (self);
+        }
+
+      return FALSE;
+    }
+
   if (flatpak_fancy_output ())
     {
       flatpak_table_printer_set_cell (self->printer, self->progress_row, 0, text);
@@ -601,9 +619,6 @@ operation_error (FlatpakTransaction            *transaction,
     }
   else
     g_printerr ("%s\n", text);
-
-  if (!non_fatal && self->stop_on_first_error)
-    return FALSE;
 
   return TRUE; /* Continue */
 }
@@ -1083,6 +1098,56 @@ append_bus (GPtrArray  *talk,
 }
 
 static void
+append_usb (GPtrArray *usb_array,
+            GKeyFile  *metadata,
+            GKeyFile  *old_metadata)
+{
+  gsize size = 0;
+  g_auto(GStrv) hidden_devices = NULL;
+  g_auto(GStrv) old_hidden_devices = NULL;
+  g_auto(GStrv) old_enumerables = NULL;
+  g_auto(GStrv) enumerables = NULL;
+
+  enumerables = g_key_file_get_string_list (metadata,
+                                            FLATPAK_METADATA_GROUP_USB_DEVICES,
+                                            FLATPAK_METADATA_KEY_USB_ENUMERABLE_DEVICES,
+                                            &size, NULL);
+
+  if (old_metadata)
+    old_enumerables = g_key_file_get_string_list (old_metadata,
+                                                  FLATPAK_METADATA_GROUP_USB_DEVICES,
+                                                  FLATPAK_METADATA_KEY_USB_ENUMERABLE_DEVICES,
+                                                  NULL, NULL);
+
+  for (size_t i = 0; i < size; i++)
+    {
+      const char *enumerable = enumerables[i];
+      if (old_enumerables == NULL || !g_strv_contains ((const char * const *) old_enumerables, enumerable))
+        g_ptr_array_add (usb_array, g_strdup (enumerable));
+    }
+
+  size = 0;
+
+  hidden_devices = g_key_file_get_string_list (metadata,
+                                               FLATPAK_METADATA_GROUP_USB_DEVICES,
+                                               FLATPAK_METADATA_KEY_USB_HIDDEN_DEVICES,
+                                               &size, NULL);
+
+  if (old_metadata)
+    old_hidden_devices = g_key_file_get_string_list (old_metadata,
+                                                     FLATPAK_METADATA_GROUP_USB_DEVICES,
+                                                     FLATPAK_METADATA_KEY_USB_HIDDEN_DEVICES,
+                                                     NULL, NULL);
+
+  for (size_t i = 0; i < size; i++)
+    {
+      const char *hidden = hidden_devices[i];
+      if (old_hidden_devices == NULL || !g_strv_contains ((const char * const *) old_hidden_devices, hidden))
+        g_ptr_array_add (usb_array, g_strdup_printf ("!%s", hidden));
+    }
+}
+
+static void
 append_tags (GPtrArray *tags_array,
              GKeyFile  *metadata,
              GKeyFile  *old_metadata)
@@ -1146,6 +1211,7 @@ print_permissions (FlatpakCliTransaction *self,
   g_autoptr(FlatpakRef) rref = flatpak_ref_parse (ref, NULL);
   g_autoptr(GPtrArray) permissions = g_ptr_array_new_with_free_func (g_free);
   g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func (g_free);
+  g_autoptr(GPtrArray) usb = g_ptr_array_new_with_free_func (g_free);
   g_autoptr(GPtrArray) session_bus_talk = g_ptr_array_new_with_free_func (g_free);
   g_autoptr(GPtrArray) session_bus_own = g_ptr_array_new_with_free_func (g_free);
   g_autoptr(GPtrArray) system_bus_talk = g_ptr_array_new_with_free_func (g_free);
@@ -1178,6 +1244,7 @@ print_permissions (FlatpakCliTransaction *self,
   append_permissions (permissions, metadata, old_metadata, FLATPAK_METADATA_KEY_DEVICES);
   append_permissions (permissions, metadata, old_metadata, FLATPAK_METADATA_KEY_FEATURES);
   append_permissions (files, metadata, old_metadata, FLATPAK_METADATA_KEY_FILESYSTEMS);
+  append_usb (usb, metadata, old_metadata);
   append_bus (session_bus_talk, session_bus_own,
               metadata, old_metadata, FLATPAK_METADATA_GROUP_SESSION_BUS_POLICY);
   append_bus (system_bus_talk, system_bus_own,
@@ -1195,6 +1262,8 @@ print_permissions (FlatpakCliTransaction *self,
     g_ptr_array_add (permissions, g_strdup_printf ("system dbus access [%d]", j++));
   if (system_bus_own->len > 0)
     g_ptr_array_add (permissions, g_strdup_printf ("system bus ownership [%d]", j++));
+  if (usb->len > 0)
+    g_ptr_array_add (permissions, g_strdup_printf ("USB portal access [%d]", j++));
   if (tags->len > 0)
     g_ptr_array_add (permissions, g_strdup_printf ("tags [%d]", j++));
 
@@ -1256,6 +1325,8 @@ print_permissions (FlatpakCliTransaction *self,
     print_perm_line (j++, system_bus_talk, cols);
   if (system_bus_own->len > 0)
     print_perm_line (j++, system_bus_own, cols);
+  if (usb->len > 0)
+    print_perm_line (j++, usb, cols);
   if (tags->len > 0)
     print_perm_line (j++, tags, cols);
 }
@@ -1291,7 +1362,7 @@ transaction_ready_pre_auth (FlatpakTransaction *transaction)
   GList *l;
   int i;
   FlatpakTablePrinter *printer;
-  const char *op_shorthand[] = { "i", "u", "i", "r" };
+  const char *op_shorthand[] = { "i", "u", "i", "r", "i" };
 
   /* These caches may no longer be valid once the transaction runs */
   g_clear_pointer (&self->runtime_app_map, g_hash_table_unref);
@@ -1387,6 +1458,7 @@ transaction_ready_pre_auth (FlatpakTransaction *transaction)
       text1 = g_strdup_printf ("< 999.9 kB (%s)", _("partial"));
       text2 = g_strdup_printf ("  123.4 MB / 999.9 MB");
       size = MAX (strlen (text1), strlen (text2));
+      /* Translators: Download is used here as a noun */
       text = g_strdup_printf ("%-*s", size, _("Download"));
       flatpak_table_printer_set_column_title (printer, i++, text);
     }
@@ -1626,6 +1698,7 @@ flatpak_cli_transaction_run (FlatpakTransaction *transaction,
 
   if (flatpak_fancy_output ())
     {
+      flatpak_pty_clear_progress ();
       flatpak_disable_raw_mode ();
       flatpak_show_cursor ();
     }

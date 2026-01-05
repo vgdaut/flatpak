@@ -157,6 +157,7 @@ struct _FlatpakExports
   FlatpakFilesystemMode host_etc;
   FlatpakFilesystemMode host_os;
   int                   host_fd;
+  FlatpakFilesystemMode host_root;
   FlatpakExportsTestFlags test_flags;
 };
 
@@ -444,7 +445,7 @@ flatpak_exports_append_bwrap_args (FlatpakExports *exports,
   eps = g_hash_table_get_values (exports->hash);
   eps = g_list_sort (eps, (GCompareFunc) compare_eps);
 
-  g_qsort_with_data (keys, n_keys, sizeof (char *), (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (keys, n_keys, sizeof (char *), flatpak_strcmp0_ptr);
 
   g_debug ("Converting FlatpakExports to bwrap arguments...");
 
@@ -643,6 +644,20 @@ flatpak_exports_append_bwrap_args (FlatpakExports *exports,
                                 etc_bind_mode, "/etc", "/run/host/etc", NULL);
     }
 
+  g_assert (exports->host_root >= FLATPAK_FILESYSTEM_MODE_NONE);
+  g_assert (exports->host_root <= FLATPAK_FILESYSTEM_MODE_LAST);
+
+  if (exports->host_root != FLATPAK_FILESYSTEM_MODE_NONE)
+    {
+      const char *root_bind_mode = "--bind";
+
+      if (exports->host_root == FLATPAK_FILESYSTEM_MODE_READ_ONLY)
+        root_bind_mode = "--ro-bind";
+
+      flatpak_bwrap_add_args (bwrap,
+                              root_bind_mode, "/", "/run/host/root", NULL);
+    }
+
   /* As per the os-release specification https://www.freedesktop.org/software/systemd/man/os-release.html
    * always read-only bind-mount /etc/os-release if it exists, or /usr/lib/os-release as a fallback from
    * the host into the application's /run/host */
@@ -666,7 +681,7 @@ flatpak_exports_path_get_mode (FlatpakExports *exports,
   g_autoptr(GString) path_builder = g_string_new ("");
   struct stat st;
 
-  g_qsort_with_data (keys, n_keys, sizeof (char *), (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (keys, n_keys, sizeof (char *), flatpak_strcmp0_ptr);
 
   /* Syntactic canonicalization only, no need to use host_fd */
   path = canonical = flatpak_canonicalize_filename (path);
@@ -1133,4 +1148,14 @@ flatpak_exports_add_host_os_expose (FlatpakExports       *exports,
   g_return_if_fail (mode <= FLATPAK_FILESYSTEM_MODE_LAST);
 
   exports->host_os = mode;
+}
+
+void
+flatpak_exports_add_host_root_expose (FlatpakExports       *exports,
+                                      FlatpakFilesystemMode mode)
+{
+  g_return_if_fail (mode > FLATPAK_FILESYSTEM_MODE_NONE);
+  g_return_if_fail (mode <= FLATPAK_FILESYSTEM_MODE_LAST);
+
+  exports->host_root = mode;
 }

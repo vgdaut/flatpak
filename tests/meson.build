@@ -4,41 +4,41 @@
 installed_testdir = get_option('prefix') / get_option('libexecdir') / 'installed-tests' / 'Flatpak'
 installed_tests_metadir = get_option('prefix') / get_option('datadir') / 'installed-tests' / 'Flatpak'
 
-tests_environment = environment()
-tests_environment.set('FLATPAK_CONFIG_DIR', '/dev/null')
-tests_environment.set(
-  'FLATPAK_PORTAL',
-  project_build_root / 'portal' / 'flatpak-portal',
-)
-tests_environment.set(
-  'FLATPAK_REVOKEFS_FUSE',
-  project_build_root / 'revokefs' / 'revokefs-fuse',
-)
-tests_environment.set('FLATPAK_TESTS_DEBUG', '1')
-tests_environment.set('FLATPAK_TESTS_STRICT_TAP', '1')
-tests_environment.set('FLATPAK_TRIGGERSDIR', project_source_root / 'triggers')
-tests_environment.set(
-  'FLATPAK_VALIDATE_ICON',
-  project_build_root / 'icon-validator' / 'flatpak-validate-icon',
-)
-tests_environment.set('FUSERMOUNT', fusermount)
-tests_environment.set('G_TEST_BUILDDIR', meson.current_build_dir())
-tests_environment.set('G_TEST_SRCDIR', meson.current_source_dir())
-tests_environment.prepend('GI_TYPELIB_PATH', project_build_root / 'common')
-tests_environment.prepend('LD_LIBRARY_PATH', project_build_root / 'common')
-tests_environment.prepend('PATH', project_build_root / 'app')
-
 if get_option('system_bubblewrap') == ''
-  tests_environment.set('FLATPAK_BWRAP', project_build_root / 'subprojects' / 'bubblewrap' / 'flatpak-bwrap')
+  env_flatpak_bwrap = project_build_root / 'subprojects' / 'bubblewrap' / 'flatpak-bwrap'
 else
-  tests_environment.set('FLATPAK_BWRAP', get_option('system_bubblewrap'))
+  env_flatpak_bwrap = get_option('system_bubblewrap')
 endif
 
 if get_option('system_dbus_proxy') == ''
-  tests_environment.set('FLATPAK_DBUSPROXY', project_build_root / 'subprojects' / 'dbus-proxy' / 'flatpak-dbus-proxy')
+  env_flatpak_dbusproxy = project_build_root / 'subprojects' / 'dbus-proxy' / 'flatpak-dbus-proxy'
 else
-  tests_environment.set('FLATPAK_DBUSPROXY', get_option('system_dbus_proxy'))
+  env_flatpak_dbusproxy = get_option('system_dbus_proxy')
 endif
+
+tests_environment = {
+  'FLATPAK_CONFIG_DIR' : '/dev/null',
+  'FLATPAK_DATA_DIR' : '/dev/null',
+  'FLATPAK_PORTAL' : project_build_root / 'portal' / 'flatpak-portal',
+  'FLATPAK_REVOKEFS_FUSE' : project_build_root / 'revokefs' / 'revokefs-fuse',
+  'FLATPAK_TESTS_DEBUG' : '1',
+  'FLATPAK_TESTS_STRICT_TAP' : '1',
+  'FLATPAK_TRIGGERSDIR' : project_source_root / 'triggers',
+  'FLATPAK_VALIDATE_ICON' : project_build_root / 'icon-validator' / 'flatpak-validate-icon',
+  'FUSERMOUNT' : fusermount,
+  'G_TEST_BUILDDIR' : meson.current_build_dir(),
+  'G_TEST_SRCDIR' : meson.current_source_dir(),
+  'FLATPAK_BWRAP' : env_flatpak_bwrap,
+  'FLATPAK_DBUSPROXY' : env_flatpak_dbusproxy,
+}
+
+tests_environment_prepend = {
+  'GI_TYPELIB_PATH' : project_build_root / 'common',
+  'LD_LIBRARY_PATH' : project_build_root / 'common',
+  'PATH' : project_build_root / 'app',
+}
+
+lsan_options = 'log_threads=1:suppressions=' + meson.current_source_dir() / 'flatpak-asan.supp'
 
 if get_option('installed_tests')
   configure_file(
@@ -46,6 +46,7 @@ if get_option('installed_tests')
     output : 'installed-tests.sh',
     configuration : {
       'FUSERMOUNT' : fusermount,
+      'FLATPAK_TRIGGERSDIR' : get_option('prefix') / get_option('datadir') / 'flatpak' / 'triggers',
     },
     install_dir : installed_testdir,
   )
@@ -143,7 +144,6 @@ foreach testcase : c_tests
       libflatpak_common_base_dep,
       libglnx_dep,
       libostree_dep,
-      libsoup_dep,
       libtestlib_dep,
     ] + options.get('extra_dependencies', [])),
     sources : [name + '.c'] + options.get('extra_sources', []),
@@ -164,13 +164,22 @@ foreach testcase : c_tests
     )
   endif
 
+  test_env = environment(tests_environment)
+  foreach k, v: tests_environment_prepend
+    test_env.prepend(k, v)
+  endforeach
+
+  lsan_log_path = ':log_path=' + meson.current_build_dir() / \
+                  'asan_' + name.underscorify() + '.log'
+  test_env.set('LSAN_OPTIONS', lsan_options + lsan_log_path)
+
   if can_run_host_binaries
     test(
       name,
       tap_test,
       args : [exe],
       depends : runtime_repo,
-      env : tests_environment,
+      env : test_env,
       protocol : 'tap',
       timeout : options.get('timeout', 30),
     )
@@ -199,7 +208,6 @@ executable(
     libflatpak_common_base_dep,
     libglnx_dep,
     libostree_dep,
-    libsoup_dep,
   ],
   include_directories : [common_include_directories],
   install : get_option('installed_tests'),
@@ -219,7 +227,6 @@ executable(
     libtestlib_dep,
     libglnx_dep,
     libostree_dep,
-    libsoup_dep,
   ],
   install : get_option('installed_tests'),
   install_dir : installed_testdir,
@@ -316,6 +323,7 @@ if get_option('installed_tests')
   )
 
   install_data(
+    'gphoto2-list',
     'libtest.sh',
     'org.flatpak.Authenticator.test.service.in',
     'org.freedesktop.impl.portal.desktop.test.service.in',
@@ -352,6 +360,7 @@ foreach testcase : wrapped_tests
     'test-summaries.sh' : 60,
     'test-unused.sh' : 90,
     'test-update-portal.sh' : 90,
+    'test-extra-data.sh' : 90,
   }.get(script, 30)
 
   is_parallel = {
@@ -382,13 +391,22 @@ foreach testcase : wrapped_tests
     )
   endif
 
+  test_env = environment(tests_environment)
+  foreach k, v: tests_environment_prepend
+    test_env.prepend(k, v)
+  endforeach
+
+  lsan_log_path = ':log_path=' + meson.current_build_dir() / \
+                  'asan_' + name.underscorify() + '.log'
+  test_env.set('LSAN_OPTIONS', lsan_options + lsan_log_path)
+
   if can_run_host_binaries
     test(
       name,
       tap_test,
       args : [meson.current_source_dir() / name],
       depends : runtime_repo,
-      env : tests_environment,
+      env : test_env,
       is_parallel : is_parallel,
       protocol : 'tap',
       timeout : timeout,

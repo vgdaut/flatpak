@@ -41,23 +41,6 @@ meson test -C _build
 sudo meson install -C _build
 ```
 
-## Building with Autotools
-
-Older branches of Flatpak used GNU Autotools. See
-https://github.com/flatpak/flatpak/blob/flatpak-1.14.x/CONTRIBUTING.md
-for more details of that build system.
-
-The Autotools build system is likely to be removed from a future version
-of Flatpak, leaving Meson as the only build system supported.
-
-Newer releases of Flatpak do not include Autotools-generated files in
-the source archive. If it is necessary to build these releases with
-Autotools for some reason, the build system must be set up by running:
-
-    ./autogen.sh
-
-before proceeding as if for any other Autotools project.
-
 ## How to run a specified set of tests
 
 Sometimes you don't want to run the whole test suite but just one you're
@@ -69,7 +52,7 @@ meson test -C _build test-info@user.wrap test-info@system.wrap
 
 ## More info
 Dependencies you will need include: meson, bison,
-gettext, gtk-doc, gobject-introspection, libcap, libarchive, libxml2, libsoup,
+gettext, gtk-doc, gobject-introspection, libcap, libarchive, libxml2, libcurl,
 gpgme, polkit, libXau, ostree, json-glib, appstream, libseccomp (or their devel
 packages).
 

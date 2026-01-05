@@ -177,15 +177,10 @@ test_empty_context (void)
   g_assert_cmpuint (g_hash_table_size (context->session_bus_policy), ==, 0);
   g_assert_cmpuint (g_hash_table_size (context->system_bus_policy), ==, 0);
   g_assert_cmpuint (g_hash_table_size (context->generic_policy), ==, 0);
-  g_assert_cmpuint (context->shares, ==, 0);
-  g_assert_cmpuint (context->shares_valid, ==, 0);
-  g_assert_cmpuint (context->sockets, ==, 0);
-  g_assert_cmpuint (context->sockets_valid, ==, 0);
-  g_assert_cmpuint (context->devices, ==, 0);
-  g_assert_cmpuint (context->devices_valid, ==, 0);
-  g_assert_cmpuint (context->features, ==, 0);
-  g_assert_cmpuint (context->features_valid, ==, 0);
-  g_assert_cmpuint (flatpak_context_get_run_flags (context), ==, 0);
+  g_assert_cmpuint (g_hash_table_size (context->shares_permissions), ==, 0);
+  g_assert_cmpuint (g_hash_table_size (context->socket_permissions), ==, 0);
+  g_assert_cmpuint (g_hash_table_size (context->device_permissions), ==, 0);
+  g_assert_cmpuint (g_hash_table_size (context->features_permissions), ==, 0);
 
   exports = flatpak_context_get_exports (context, "com.example.App");
   g_assert_nonnull (exports);
@@ -230,7 +225,7 @@ test_full_context (void)
   g_key_file_set_value (keyfile,
                         FLATPAK_METADATA_GROUP_CONTEXT,
                         FLATPAK_METADATA_KEY_DEVICES,
-                        "dri;all;kvm;shm;");
+                        "dri;all;kvm;shm;if:all:true;if:all:!has-wayland;");
   g_key_file_set_value (keyfile,
                         FLATPAK_METADATA_GROUP_CONTEXT,
                         FLATPAK_METADATA_KEY_FEATURES,
@@ -268,41 +263,33 @@ test_full_context (void)
   flatpak_context_load_metadata (context, keyfile, &error);
   g_assert_no_error (error);
 
-  g_assert_cmpuint (context->shares, ==,
+  FlatpakContextShares shares = flatpak_context_compute_allowed_shares (context, NULL);
+  g_assert_cmpuint (shares, ==,
                     (FLATPAK_CONTEXT_SHARED_NETWORK |
                      FLATPAK_CONTEXT_SHARED_IPC));
-  g_assert_cmpuint (context->shares_valid, ==, context->shares);
-  g_assert_cmpuint (context->devices, ==,
+  FlatpakContextDevices devices = flatpak_context_compute_allowed_devices (context, NULL);
+  g_assert_cmpuint (devices, ==,
                     (FLATPAK_CONTEXT_DEVICE_DRI |
                      FLATPAK_CONTEXT_DEVICE_ALL |
                      FLATPAK_CONTEXT_DEVICE_KVM |
                      FLATPAK_CONTEXT_DEVICE_SHM));
-  g_assert_cmpuint (context->devices_valid, ==, context->devices);
-  g_assert_cmpuint (context->sockets, ==,
-                    (FLATPAK_CONTEXT_SOCKET_X11 |
-                     FLATPAK_CONTEXT_SOCKET_WAYLAND |
+  FlatpakContextSockets sockets = flatpak_context_compute_allowed_sockets (context, NULL);
+  g_assert_cmpuint (sockets, ==,
+                    (FLATPAK_CONTEXT_SOCKET_WAYLAND |
                      FLATPAK_CONTEXT_SOCKET_INHERIT_WAYLAND_SOCKET |
                      FLATPAK_CONTEXT_SOCKET_PULSEAUDIO |
                      FLATPAK_CONTEXT_SOCKET_SESSION_BUS |
                      FLATPAK_CONTEXT_SOCKET_SYSTEM_BUS |
-                     FLATPAK_CONTEXT_SOCKET_FALLBACK_X11 |
                      FLATPAK_CONTEXT_SOCKET_SSH_AUTH |
                      FLATPAK_CONTEXT_SOCKET_PCSC |
                      FLATPAK_CONTEXT_SOCKET_CUPS));
-  g_assert_cmpuint (context->sockets_valid, ==, context->sockets);
-  g_assert_cmpuint (context->features, ==,
+  FlatpakContextFeatures features = flatpak_context_compute_allowed_features (context, NULL);
+  g_assert_cmpuint (features, ==,
                     (FLATPAK_CONTEXT_FEATURE_DEVEL |
                      FLATPAK_CONTEXT_FEATURE_MULTIARCH |
                      FLATPAK_CONTEXT_FEATURE_BLUETOOTH |
                      FLATPAK_CONTEXT_FEATURE_CANBUS |
                      FLATPAK_CONTEXT_FEATURE_PER_APP_DEV_SHM));
-  g_assert_cmpuint (context->features_valid, ==, context->features);
-
-  g_assert_cmpuint (flatpak_context_get_run_flags (context), ==,
-                    (FLATPAK_RUN_FLAG_DEVEL |
-                     FLATPAK_RUN_FLAG_MULTIARCH |
-                     FLATPAK_RUN_FLAG_BLUETOOTH |
-                     FLATPAK_RUN_FLAG_CANBUS));
 
   g_assert_cmpuint (g_hash_table_size (context->env_vars), ==, 3);
   g_assert_true (g_hash_table_contains (context->env_vars, "LD_AUDIT"));
@@ -342,8 +329,7 @@ test_full_context (void)
                                      &n, &error);
   g_assert_nonnull (strv);
   /* The order is undefined, so sort them first */
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "!/opt");
   g_assert_cmpstr (strv[i++], ==, "/home");
@@ -357,8 +343,7 @@ test_full_context (void)
                                      &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "ipc");
   g_assert_cmpstr (strv[i++], ==, "network");
@@ -371,8 +356,7 @@ test_full_context (void)
                                      &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "cups");
   g_assert_cmpstr (strv[i++], ==, "fallback-x11");
@@ -383,7 +367,6 @@ test_full_context (void)
   g_assert_cmpstr (strv[i++], ==, "ssh-auth");
   g_assert_cmpstr (strv[i++], ==, "system-bus");
   g_assert_cmpstr (strv[i++], ==, "wayland");
-  g_assert_cmpstr (strv[i++], ==, "x11");
   g_assert_cmpstr (strv[i], ==, NULL);
   g_assert_cmpuint (i, ==, n);
   g_clear_pointer (&strv, g_strfreev);
@@ -393,11 +376,12 @@ test_full_context (void)
                                      &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "all");
   g_assert_cmpstr (strv[i++], ==, "dri");
+  g_assert_cmpstr (strv[i++], ==, "if:all:!has-wayland");
+  g_assert_cmpstr (strv[i++], ==, "if:all:true");
   g_assert_cmpstr (strv[i++], ==, "kvm");
   g_assert_cmpstr (strv[i++], ==, "shm");
   g_assert_cmpstr (strv[i], ==, NULL);
@@ -409,8 +393,7 @@ test_full_context (void)
                                      &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, ".openarena");
   g_assert_cmpstr (strv[i], ==, NULL);
@@ -422,8 +405,7 @@ test_full_context (void)
                                      &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "LD_AUDIT");
   g_assert_cmpstr (strv[i++], ==, "LD_PRELOAD");
@@ -435,8 +417,7 @@ test_full_context (void)
                               &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "org.example.SessionService");
   g_assert_cmpstr (strv[i], ==, NULL);
@@ -453,8 +434,7 @@ test_full_context (void)
                               &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "net.example.SystemService");
   g_assert_cmpstr (strv[i], ==, NULL);
@@ -471,8 +451,7 @@ test_full_context (void)
                               &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "HYPOTHETICAL_PATH");
   g_assert_cmpstr (strv[i++], ==, "LD_AUDIT");
@@ -501,8 +480,7 @@ test_full_context (void)
                               &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "Colours");
   g_assert_cmpstr (strv[i], ==, NULL);
@@ -513,8 +491,7 @@ test_full_context (void)
                                      "Colours", &n, &error);
   g_assert_no_error (error);
   g_assert_nonnull (strv);
-  g_qsort_with_data (strv, n, sizeof (char *),
-                     (GCompareDataFunc) flatpak_strcmp0_ptr, NULL);
+  qsort (strv, n, sizeof (char *), flatpak_strcmp0_ptr);
   i = 0;
   g_assert_cmpstr (strv[i++], ==, "blue");
   g_assert_cmpstr (strv[i++], ==, "green");

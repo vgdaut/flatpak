@@ -106,9 +106,6 @@ flatpak_installation_class_init (FlatpakInstallationClass *klass)
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
   object_class->finalize = flatpak_installation_finalize;
-
-  /* Avoid weird recursive type initialization deadlocks from libsoup */
-  g_type_ensure (G_TYPE_SOCKET);
 }
 
 static void
@@ -1728,8 +1725,8 @@ flatpak_installation_load_app_overrides (FlatpakInstallation *self,
  * flatpak_installation_install_bundle:
  * @self: a #FlatpakInstallation
  * @file: a #GFile that is an flatpak bundle
- * @progress: (scope call) (nullable): progress callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): progress callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -1775,7 +1772,7 @@ flatpak_installation_install_bundle (FlatpakInstallation    *self,
   if (!flatpak_dir_ensure_repo (dir_clone, cancellable, error))
     return NULL;
 
-  if (!flatpak_dir_install_bundle (dir_clone, file, remote, NULL,
+  if (!flatpak_dir_install_bundle (dir_clone, FALSE, file, remote, NULL,
                                    cancellable, error))
     return NULL;
 
@@ -1854,8 +1851,8 @@ flatpak_installation_install_ref_file (FlatpakInstallation *self,
  * @arch: (nullable): which architecture to fetch (default: current architecture)
  * @branch: (nullable): which branch to fetch (default: 'master')
  * @subpaths: (nullable) (array zero-terminated=1): A list of subpaths to fetch, or %NULL for everything
- * @progress: (scope call) (nullable): progress callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): progress callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -1929,8 +1926,8 @@ flatpak_installation_install_full (FlatpakInstallation    *self,
                             (flags & FLATPAK_INSTALL_FLAGS_NO_PULL) != 0,
                             (flags & FLATPAK_INSTALL_FLAGS_NO_DEPLOY) != 0,
                             (flags & FLATPAK_INSTALL_FLAGS_NO_STATIC_DELTAS) != 0,
-                            FALSE, FALSE, FALSE, state,
-                            ref, NULL, (const char **) subpaths, NULL, NULL, NULL, NULL,
+                            FALSE, FALSE, FALSE, FALSE, state,
+                            ref, NULL, (const char **) subpaths, NULL, NULL, NULL, NULL, NULL,
                             progress, cancellable, error))
     return NULL;
 
@@ -1959,8 +1956,8 @@ flatpak_installation_install_full (FlatpakInstallation    *self,
  * @name: name of the app/runtime to fetch
  * @arch: (nullable): which architecture to fetch (default: current architecture)
  * @branch: (nullable): which branch to fetch (default: 'master')
- * @progress: (scope call) (nullable): progress callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): progress callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -2010,8 +2007,8 @@ flatpak_installation_install (FlatpakInstallation    *self,
  * @arch: (nullable): architecture of the app or runtime to update (default: current architecture)
  * @branch: (nullable): name of the branch of the app or runtime to update (default: master)
  * @subpaths: (nullable) (array zero-terminated=1): A list of subpaths to fetch, or %NULL for everything
- * @progress: (scope call) (nullable): the callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): the callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -2098,7 +2095,7 @@ flatpak_installation_update_full (FlatpakInstallation    *self,
                            (flags & FLATPAK_UPDATE_FLAGS_NO_STATIC_DELTAS) != 0,
                            FALSE, FALSE, FALSE, state,
                            ref, target_commit,
-                           (const char **) subpaths, NULL, NULL, NULL, NULL,
+                           (const char **) subpaths, NULL, NULL, NULL, NULL, NULL,
                            progress, cancellable, error))
     return NULL;
 
@@ -2125,8 +2122,8 @@ flatpak_installation_update_full (FlatpakInstallation    *self,
  * @name: name of the app or runtime to update
  * @arch: (nullable): architecture of the app or runtime to update (default: current architecture)
  * @branch: (nullable): name of the branch of the app or runtime to update (default: master)
- * @progress: (scope call) (nullable): the callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): the callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -2173,8 +2170,8 @@ flatpak_installation_update (FlatpakInstallation    *self,
  *  %NULL, flatpak_get_default_arch() is assumed
  * @branch: (nullable): name of the branch of the app or runtime to uninstall;
  *  if %NULL, `master` is assumed
- * @progress: (scope call) (nullable): the callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): the callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -2216,8 +2213,8 @@ flatpak_installation_uninstall (FlatpakInstallation    *self,
  *  %NULL, flatpak_get_default_arch() is assumed
  * @branch: (nullable): name of the branch of the app or runtime to uninstall;
  *  if %NULL, `master` is assumed
- * @progress: (scope call) (nullable): the callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): the callback
+ * @progress_data: (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -2604,8 +2601,8 @@ flatpak_installation_update_appstream_sync (FlatpakInstallation *self,
  * @self: a #FlatpakInstallation
  * @remote_name: the name of the remote
  * @arch: (nullable): Architecture to update, or %NULL for the local machine arch
- * @progress: (scope call) (nullable): progress callback
- * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @progress: (scope call) (closure progress_data) (nullable): progress callback
+ * @progress_data: (nullable): user data passed to @progress
  * @out_changed: (nullable): Set to %TRUE if the contents of the appstream changed, %FALSE if nothing changed
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError

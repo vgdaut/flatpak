@@ -559,7 +559,6 @@ flatpak_resolve_matching_remotes (GPtrArray      *remote_dir_pairs,
                                   GError        **error)
 {
   guint chosen = 0; /* 1 indexed */
-  guint i;
 
   g_assert (remote_dir_pairs->len > 0);
 
@@ -568,34 +567,21 @@ flatpak_resolve_matching_remotes (GPtrArray      *remote_dir_pairs,
    * step after the dependencies are resolved.
    */
   if (remote_dir_pairs->len == 1)
-    chosen = 1;
-
-  if (chosen == 0)
     {
-      if (remote_dir_pairs->len == 1)
+      chosen = 1;
+    }
+  else
+    {
+      g_auto(GStrv) names = g_new0 (char *, remote_dir_pairs->len + 1);
+      for (guint i = 0; i < remote_dir_pairs->len; i++)
         {
-          RemoteDirPair *pair = g_ptr_array_index (remote_dir_pairs, 0);
-          const char *dir_name = flatpak_dir_get_name_cached (pair->dir);
-          if (flatpak_yes_no_prompt (TRUE, /* default to yes on Enter */
-                                     _("Found similar ref(s) for ‘%s’ in remote ‘%s’ (%s).\nUse this remote?"),
-                                     opt_search_ref, pair->remote_name, dir_name))
-            chosen = 1;
-          else
-            return flatpak_fail (error, _("No remote chosen to resolve matches for ‘%s’"), opt_search_ref);
+          RemoteDirPair *pair = g_ptr_array_index (remote_dir_pairs, i);
+          names[i] = g_strdup_printf ("‘%s’ (%s)", pair->remote_name, flatpak_dir_get_name_cached (pair->dir));
         }
-      else
-        {
-          g_auto(GStrv) names = g_new0 (char *, remote_dir_pairs->len + 1);
-          for (i = 0; i < remote_dir_pairs->len; i++)
-            {
-              RemoteDirPair *pair = g_ptr_array_index (remote_dir_pairs, i);
-              names[i] = g_strdup_printf ("‘%s’ (%s)", pair->remote_name, flatpak_dir_get_name_cached (pair->dir));
-            }
-          flatpak_format_choices ((const char **) names, _("Remotes found with refs similar to ‘%s’:"), opt_search_ref);
-          chosen = flatpak_number_prompt (TRUE, 0, remote_dir_pairs->len, _("Which do you want to use (0 to abort)?"));
-          if (chosen == 0)
-            return flatpak_fail (error, _("No remote chosen to resolve matches for ‘%s’"), opt_search_ref);
-        }
+      flatpak_format_choices ((const char **) names, _("Remotes found with refs similar to ‘%s’:"), opt_search_ref);
+      chosen = flatpak_number_prompt (TRUE, 0, remote_dir_pairs->len, _("Which do you want to use (0 to abort)?"));
+      if (chosen == 0)
+        return flatpak_fail (error, _("No remote chosen to resolve matches for ‘%s’"), opt_search_ref);
     }
 
   if (out_pair)
@@ -1461,6 +1447,39 @@ ensure_remote_state_all_arches (FlatpakDir         *dir,
   /* Then download rest */
   if (!flatpak_remote_state_ensure_subsummary_all_arches (state, dir, FALSE, cancellable, error))
     return FALSE;
+
+  return TRUE;
+}
+
+gboolean
+setup_sideload_repositories (FlatpakTransaction *transaction,
+                             char              **opt_sideload_repos,
+                             GCancellable       *cancellable,
+                             GError            **error)
+{
+  for (int i = 0; opt_sideload_repos != NULL && opt_sideload_repos[i] != NULL; i++)
+    {
+      const char *repo = opt_sideload_repos[i];
+      if (g_str_has_prefix (repo, "oci:") || g_str_has_prefix (repo, "oci-archive:"))
+        {
+          if (!flatpak_transaction_add_sideload_image_collection (transaction, repo, cancellable, error))
+            return FALSE;
+        }
+      else if (g_str_has_prefix (repo, "file:"))
+        {
+          g_autoptr(GFile) file = g_file_new_for_uri (repo);
+          const char *path = flatpak_file_get_path_cached (file);
+          flatpak_transaction_add_sideload_repo (transaction, path);
+        }
+      else
+        {
+          if (g_regex_match_simple ("^[A-Za-z][A-Za-z0-9+.-]*:", repo,
+                                    G_REGEX_DEFAULT, G_REGEX_MATCH_DEFAULT))
+            return flatpak_fail (error, _("Unknown scheme in sideload location %s"), repo);
+
+          flatpak_transaction_add_sideload_repo (transaction, repo);
+        }
+    }
 
   return TRUE;
 }

@@ -30,6 +30,7 @@
 #include "libglnx.h"
 
 #include "flatpak-builtins.h"
+#include "flatpak-repo-utils-private.h"
 #include "flatpak-utils-private.h"
 #include "flatpak-table-printer.h"
 #include "flatpak-variant-impl-private.h"
@@ -40,6 +41,7 @@ static gboolean opt_subsets;
 static gchar *opt_metadata_branch;
 static gchar *opt_commits_branch;
 static gchar *opt_subset;
+static gboolean opt_json;
 
 static gboolean
 ostree_repo_mode_to_string (OstreeRepoMode mode,
@@ -253,9 +255,9 @@ print_branches_for_subsummary (FlatpakTablePrinter *printer,
 
           flatpak_table_printer_add_column (printer, ""); /* Options */
 
-          if (g_variant_lookup (ref_meta, FLATPAK_SPARSE_CACHE_KEY_ENDOFLINE, "&s", &eol))
+          if (g_variant_lookup (ref_meta, FLATPAK_SPARSE_CACHE_KEY_ENDOFLIFE, "&s", &eol))
             flatpak_table_printer_append_with_comma_printf (printer, "eol=%s", eol);
-          if (g_variant_lookup (ref_meta, FLATPAK_SPARSE_CACHE_KEY_ENDOFLINE_REBASE, "&s", &eol))
+          if (g_variant_lookup (ref_meta, FLATPAK_SPARSE_CACHE_KEY_ENDOFLIFE_REBASE, "&s", &eol))
             flatpak_table_printer_append_with_comma_printf (printer, "eol-rebase=%s", eol);
 
 
@@ -308,9 +310,9 @@ print_branches_for_subsummary (FlatpakTablePrinter *printer,
                   if (g_variant_lookup (sparse_cache, ref, "@a{sv}", &sparse))
                     {
                       const char *eol;
-                      if (g_variant_lookup (sparse, FLATPAK_SPARSE_CACHE_KEY_ENDOFLINE, "&s", &eol))
+                      if (g_variant_lookup (sparse, FLATPAK_SPARSE_CACHE_KEY_ENDOFLIFE, "&s", &eol))
                         flatpak_table_printer_append_with_comma_printf (printer, "eol=%s", eol);
-                      if (g_variant_lookup (sparse, FLATPAK_SPARSE_CACHE_KEY_ENDOFLINE_REBASE, "&s", &eol))
+                      if (g_variant_lookup (sparse, FLATPAK_SPARSE_CACHE_KEY_ENDOFLIFE_REBASE, "&s", &eol))
                         flatpak_table_printer_append_with_comma_printf (printer, "eol-rebase=%s", eol);
                     }
                 }
@@ -332,6 +334,7 @@ print_branches (OstreeRepo *repo,
   printer = flatpak_table_printer_new ();
   flatpak_table_printer_set_column_title (printer, 0, _("Ref"));
   flatpak_table_printer_set_column_title (printer, 1, _("Installed"));
+  /* Translators: Download is used here as a noun */
   flatpak_table_printer_set_column_title (printer, 2, _("Download"));
   flatpak_table_printer_set_column_title (printer, 3, _("Subsets"));
   flatpak_table_printer_set_column_title (printer, 4, _("Options"));
@@ -376,7 +379,7 @@ print_branches (OstreeRepo *repo,
 
   flatpak_table_printer_sort (printer, (GCompareFunc) strcmp);
 
-  flatpak_table_printer_print (printer);
+  opt_json ? flatpak_table_printer_print_json (printer) : flatpak_table_printer_print (printer);
 }
 
 static void
@@ -425,7 +428,7 @@ print_subsets (OstreeRepo *repo,
         }
     }
 
-  flatpak_table_printer_print (printer);
+  opt_json ? flatpak_table_printer_print_json (printer) : flatpak_table_printer_print (printer);
 }
 
 
@@ -711,6 +714,7 @@ static GOptionEntry options[] = {
   { "commits", 0, 0, G_OPTION_ARG_STRING, &opt_commits_branch, N_("Show commits for a branch"), N_("BRANCH") },
   { "subsets", 0, 0, G_OPTION_ARG_NONE, &opt_subsets, N_("Print information about the repo subsets"), NULL },
   { "subset", 0, 0, G_OPTION_ARG_STRING, &opt_subset, N_("Limit information to subsets with this prefix"), NULL },
+  { "json", 'j', 0, G_OPTION_ARG_NONE, &opt_json, N_("Show output in JSON format"), NULL },
   { NULL }
 };
 
