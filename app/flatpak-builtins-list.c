@@ -306,7 +306,7 @@ print_table_for_refs (gboolean      print_apps,
 
                   size = flatpak_deploy_data_get_installed_size (deploy_data);
                   if (opt_bytes)
-                    size_s = g_strdup_printf("%lu", size);
+                    size_s = g_strdup_printf ("%lu", size);
                   else
                     size_s = g_format_size (size);
                   flatpak_table_printer_add_decimal_column (printer, size_s);
